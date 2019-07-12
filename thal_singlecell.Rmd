@@ -1,0 +1,633 @@
+---
+title: "ThalamoSeq single-cell data"
+author: "Anton Schulmann"
+date: "July, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## QC and prparing data
+
+```{r, setup, eval=FALSE}
+
+##define variables
+#sc_metadata
+#sc_counts
+
+df_sc_qc=reshape2::melt(sc_metadata[,c("sample_names","lib_size","gene_det")])
+ggplot(data = df_sc_qc, aes(x=sample_names,y=log10(value+1))) + ggbeeswarm::geom_quasirandom(size=.25) + theme_bw() + geom_hline(yintercept=log10(20000), linetype="dashed") +facet_wrap(~variable)
+
+p_libsize=ggplot(data = sc_metadata, aes(x=sample_names,y=log10(lib_size+1))) + ggbeeswarm::geom_quasirandom(size=.05) + theme_bw() + geom_hline(yintercept=log10(20000), linetype="dashed") + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5)) + xlab(NULL) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+p_genedet=ggplot(data = sc_metadata, aes(x=sample_names,y=log10(gene_det+1))) + ggbeeswarm::geom_quasirandom(size=.05) + theme_bw() + geom_hline(yintercept=log10(2500+1), linetype="dashed") + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5)) + xlab(NULL) + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())
+
+
+## plot swarmplots
+gridExtra::grid.arrange(p_libsize, p_genedet, nrow=2)
+
+## filter data
+keep=sc_metadata$lib_size>20000 & sc_metadata$lib_size<10^6 & sc_metadata$gene_det>2500 & sc_metadata$sample_names!="qRNA" & sc_metadata$sample_names!="empty"
+
+#CPM normalization
+sc_counts.norm_f=10^6*t(t(sc_counts_f)/rowSums(t(sc_counts_f)))
+
+```
+
+ERCC
+
+```{r, ercc}
+
+ercc_sc_counts=sc_counts_f[idx_ercc,!idx_odc]
+ercc_sc_counts=ercc_sc_counts[match(ercc_anno$ERCC.ID,rownames(ercc_sc_counts)),]
+ercc_sc_counts[is.na(ercc_sc_counts)]=0
+rownames(ercc_sc_counts)=ercc_anno$ERCC.ID
+
+ercc_sc=data.frame(counts=rowMeans(ercc_sc_counts),detected=rowSums(ercc_sc_counts[1:92,]!=0)/1952,
+                   sd=apply(ercc_sc_counts,1,sd),conc=ercc_anno$concentration.in.Mix.1..attomoles.ul.)
+ercc_sc$molecules=ercc_sc$conc*602214.15*10^-7
+ercc_sc$sem=ercc_sc$sd/sqrt(1952)
+s.lm_ercc_sc=summary(lm(data = ercc_sc, formula = log10(counts+.01) ~ log10(molecules)))
+p_ercc_sc1=ggplot(data = ercc_sc, aes(x=log10(molecules),y=log10(counts+.01))) + geom_point() +geom_smooth(method = "lm") + ggtitle("ERCC spike-in levels") + theme_bw() + theme(plot.title = element_text(hjust = 0.5)) + annotate("text",x=c(-3,-3),y=c(2.75,3.25),label=list(bquote(p==.(format(s.lm_ercc_sc$coefficients[2,4], digits = 3))),bquote(R^2==.(format(s.lm_ercc_sc$r.squared,digits=3)))), parse=T,hjust=0)
+s.glm_ercc_sc=summary(glm(data = ercc_sc, formula = detected ~ log10(molecules), family = "binomial"))
+p_ercc_sc2=ggplot(data = ercc_sc, aes(x=log10(molecules),y=detected)) + geom_point() + geom_smooth(method = "glm",method.args = list(family = "binomial")) + ggtitle("ERCC spike-in detection") + theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+
+#plot ercc levels and detection
+gridExtra::grid.arrange(p_ercc_sc1,p_ercc_sc2,ncol=2)
+
+```
+
+
+## PCA and ODC removal
+
+Run Seurat, PCA exploration
+
+```{r, seurat}
+
+library(Seurat)
+
+# Create the object and set the initial identities
+keep_cells=rowSums(sc_counts_f)>=10 & !grepl("ERCC",rownames(sc_counts)) # only keep genes expressed in >=10 cells
+
+# Seurat pipline
+sc_all0  <- CreateSeuratObject(raw.data = sc_counts_f[keep_cells,])
+mito.genes <- grep(pattern = "^mt-", x = rownames(x = sc_all0@data), value = TRUE)
+percent.mito <- Matrix::colSums(sc_all0@raw.data[mito.genes, ])/Matrix::colSums(sc_all0@raw.data)
+sc_all0@meta.data=data.frame(sc_all0@meta.data, sc_metadata_f, mito_rate=percent.mito)
+VlnPlot(object = sc_all0, features.plot = c("nGene", "nUMI","mito_rate"), nCol = 3)
+
+# log-normalize 
+sc_all0 <- NormalizeData(object = sc_all0)
+#find variable genes (default >1SD across 20 bins)
+sc_all0 <- FindVariableGenes(object = sc_all0, x.low.cutoff = 0)
+#scale
+sc_all0 <- ScaleData(object = sc_all0, genes.use = sc_all0@var.genes)
+
+#PCA
+sc_all0 <- RunPCA(object = sc_all0, pc.genes = sc_all0@var.genes, pcs.compute = 40, pcs.print = 1:10, maxit = 500, weight.by.var = FALSE)
+
+```
+
+
+ODC contamination (PC3)
+
+```{r, odc}
+
+PCElbowPlot(object = sc_all0, num.pc = 40)
+PCHeatmap(object = sc_all0, pc.use = 1:12,100)
+#PC3 has lots of oligodenrocytic genes
+
+#plot the top 30 genes for the top 100 cells with the highest PC scores
+m_sc_pc3=PCHeatmap(object = sc_all0, pc.use = 3,100, do.return = T)
+library(ComplexHeatmap)
+Heatmap(m_sc_pc3,col=circlize::colorRamp2(seq(-2.5,2.5, length = 10), rev(RColorBrewer::brewer.pal(10, "RdBu"))), heatmap_legend_param = list(color_bar="continuous", title="Z-score"), column_title = "PC3 top loadings", cluster_columns = F, cluster_rows = F, show_column_names = F)
+
+ggplot(data = data.frame(sc_all0@dr$pca@cell.embeddings), aes(x=PC3)) +geom_histogram(bins = 50, colour="black", fill="gray50") + labs(x="PC3 (oligodendroglial)", y="Frequency") + geom_vline(xintercept=-.05, linetype="dashed") + theme_classic()
+
+#index the ODC (cells with big score on PC3): 20 ODC-contaminated neurons
+idx_odc=sc_all0@dr$pca@cell.embeddings[,3]<(-.05)
+
+```
+
+Plot PC1 single-cell and pooled-cell
+
+```{r, pc1_pooled_sc}
+
+# select sc data from the top 500 genes (see DGE of pooled-cell data)
+pc1_pooled=pca_anodev$rotation[,1]
+sc_cpm_pooled.pc1=sc_counts.norm_f[names(pc1_pooled)[names(pc1_pooled) %in% rownames(sc_counts.norm_f)],!idx_odc]
+pca_sc_pooled_anodev=mypca(log2(sc_cpm_pooled.pc1+1))
+
+df_sc_pooled_pc1_loading=data.frame(pooled_PC1=pc1_pooled[rownames(sc_cpm_pooled.pc1)],sc_PC1=pca_sc_pooled_anodev$rotation[rownames(sc_cpm_pooled.pc1),1])
+s.lm_sc_pooled_pc1=summary(lm(data = df_sc_pooled_pc1_loading, formula=sc_PC1~pooled_PC1))
+
+#plot correlation of both PC1
+ggplot(data = df_sc_pooled_pc1_loading, aes(x=pooled_PC1,y=sc_PC1)) + geom_point(color="gray50",size=.75) +geom_smooth(method = "lm") + theme_bw() + theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank()) + labs(x="pooled-cell PC1 loading", y="single-cell PC1 loadings") + annotate("text",x=c(.12,.12),y=c(.13,.15),label=list(bquote(p==.(format(s.lm_sc_pooled_pc1$coefficients[2,4], digits = 3))),bquote(R^2==.(format(s.lm_sc_pooled_pc1$r.squared,digits=3)))), parse=T,hjust=1)
+
+```
+
+## Clustering
+
+Joint clusters
+
+```{r, seurat_all}
+
+#function to run Seurat PCA
+run_seurat_pca=function(counts){
+  obj  <- CreateSeuratObject(raw.data = counts)
+  obj <- NormalizeData(object = obj)
+  obj <- FindVariableGenes(object = obj)
+  print(length(x = obj@var.genes))
+  obj <- ScaleData(object = obj, model.use = "negbinom")
+  RunPCA(object = obj, pc.genes = obj@var.genes, pcs.compute = 40, pcs.print = 1:5, maxit = 500, weight.by.var = FALSE)
+}
+
+#function to run Seurat Clustering
+#using top 10 PCs
+run_seurat_clust=function(obj, dims.use=1:10){
+  obj=RunTSNE(object = obj, dims.use = 1:10, do.fast = TRUE)
+  FindClusters(object = obj, reduction.type = "pca", dims.use = dims.use, 
+    resolution = .6, print.output = 0, save.SNN = TRUE)
+}
+
+sc_all=sc_counts_f[keep_cells,!idx_odc]
+#run Seurat PCA
+seurat_all=run_seurat_pca(sc_all)
+
+PCElbowPlot(seurat_VAL, num.pc = 15)
+PCHeatmap(object = seurat_all, pc.use = 1:12,100)
+
+# run clustering (with top 10 PCs and 0.6 resolution)
+seurat_all=run_seurat_clust(seurat_all)
+# look at clustering result on tSNE
+TSNEPlot(seurat_all)
+
+```
+
+
+Clustering by projection
+
+```{r, seurat_byProj}
+
+seurat_VAL=run_seurat_pca(sc_VAL)
+seurat_VBPO=run_seurat_pca(sc_VBPO)
+seurat_MD=run_seurat_pca(sc_MD)
+seurat_MGB=run_seurat_pca(sc_MGB)
+seurat_LGLP=run_seurat_pca(sc_LGLP)
+
+# elbow plots
+p_eb_VAL=PCElbowPlot(seurat_VAL, num.pc = 15) + ggtitle("Motor")
+p_eb_VBPO=PCElbowPlot(seurat_VBPO, num.pc = 15) + ggtitle("Somatosensory")
+p_eb_LGLP=PCElbowPlot(seurat_LGLP, num.pc = 15) + ggtitle("Visual")
+p_eb_MGB=PCElbowPlot(seurat_MGB, num.pc = 15) + ggtitle("Auditory")
+p_eb_MD=PCElbowPlot(seurat_MD, num.pc = 15) + ggtitle("Prefrontal")
+
+seurat_VAL=run_seurat_clust(seurat_VAL)
+seurat_VBPO=run_seurat_clust(seurat_VBPO)
+seurat_MD=run_seurat_clust(seurat_MD)
+seurat_MGB=run_seurat_clust(seurat_MGB)
+seurat_LGLP=run_seurat_clust(seurat_LGLP)
+
+# look at tSNE for each projection
+gridExtra:::grid.arrange(p_eb_VAL,p_eb_LGLP, p_eb_MD,p_eb_VBPO, p_eb_MGB,  nrow=2, ncol=3)
+
+```
+
+
+## Projection on PC1
+
+```{r, pc1proj}
+
+#sc_cpm_pooled.pc1 defined above (matched values)
+#projection of single-cell data onto pooled-cell PC1
+sc_proj_pooled.pc1= scale(t(log2(sc_cpm_pooled.pc1+1)), center = T, scale = F) %*% pca_anodev$rotation[rownames(sc_cpm_pooled.pc1),1]
+
+#visualize PC1 projection on tSNE
+df_pc1.pooled=data.frame(seurat_all@dr$tsne@cell.embeddings, PC1=sc_proj_pooled.pc1[,1])
+ggplot(aes(x=tSNE_1, y=tSNE_2), data = df_pc1.pooled) + geom_point(aes(colour=PC1)) + scale_color_gradientn(colours = rev(RColorBrewer::brewer.pal(10, "Spectral")), guide_colourbar(title="PC1"))
+
+#CPMs for each projection, matched
+sc_cpm_pooled.pc1_val=sc_counts.norm_f[names(pc1_pooled)[names(pc1_pooled) %in% rownames(sc_counts.norm_f)],sc_metadata_f$sample_names=="Motor" & !idx_odc]
+sc_cpm_pooled.pc1_vbpo=sc_counts.norm_f[names(pc1_pooled)[names(pc1_pooled) %in% rownames(sc_counts.norm_f)],sc_metadata_f$sample_names=="Somatosensory" & !idx_odc]
+sc_cpm_pooled.pc1_md=sc_counts.norm_f[names(pc1_pooled)[names(pc1_pooled) %in% rownames(sc_counts.norm_f)],sc_metadata_f$sample_names=="Prefrontal" & !idx_odc]
+sc_cpm_pooled.pc1_mgb=sc_counts.norm_f[names(pc1_pooled)[names(pc1_pooled) %in% rownames(sc_counts.norm_f)],sc_metadata_f$sample_names=="Auditory" & !idx_odc]
+sc_cpm_pooled.pc1_lglp=sc_counts.norm_f[names(pc1_pooled)[names(pc1_pooled) %in% rownames(sc_counts.norm_f)],sc_metadata_f$sample_names=="Visual" & !idx_odc]
+
+# projection onto PC1
+sc_proj_pooled.pc=list(VAL=scale(t(log2(sc_cpm_pooled.pc1_val+1)),center=T,scale=F) %*% pca_anodev$rotation[rownames(sc_cpm_pooled.pc1),1],
+                           VBPO=scale(t(log2(sc_cpm_pooled.pc1_vbpo+1)),center=T,scale=F) %*% pca_anodev$rotation[rownames(sc_cpm_pooled.pc1),1],
+                           MD=scale(t(log2(sc_cpm_pooled.pc1_md+1)),center=T,scale=F) %*% pca_anodev$rotation[rownames(sc_cpm_pooled.pc1),1],
+                           MGB=scale(t(log2(sc_cpm_pooled.pc1_mgb+1)),center=T,scale=F) %*% pca_anodev$rotation[rownames(sc_cpm_pooled.pc1),1],
+                     LGLP=scale(t(log2(sc_cpm_pooled.pc1_lglp+1)),center=T,scale=F) %*% pca_anodev$rotation[rownames(sc_cpm_pooled.pc1),1])
+
+## generate tSNE plots for each projection
+#col_pc1=darken(rev(matlab::jet.colors(20)),1.15) #previous version: jet color scheme
+col_pc1=RColorBrewer::brewer.pal(11,"Spectral")
+
+df_pc1.pooled_val=data.frame(seurat_VAL@dr$tsne@cell.embeddings, cluster=seurat_VAL@ident, PC1=sc_proj_pooled.pc$VAL)
+p_val=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=PC1), data = df_pc1.pooled_val) + scale_color_gradientn(colours = col_pc1) + geom_point(size=.6) + ggtitle("Motor") + theme_classic() + theme(plot.title = element_text(hjust = 0.5)) + labs(x=NULL,y=NULL) 
+
+df_pc1.pooled_vbpo=data.frame(seurat_VBPO@dr$tsne@cell.embeddings, cluster=seurat_VBPO@ident, PC1=sc_proj_pooled.pc$VBPO)
+p_vbpo=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=PC1), data = df_pc1.pooled_vbpo) + scale_color_gradientn(colours = col_pc1) + geom_point(size=.6) + ggtitle("Somatosensory") + theme_classic() + theme(plot.title = element_text(hjust = 0.5)) + labs(x=NULL,y=NULL) 
+
+df_pc1.pooled_md=data.frame(seurat_MD@dr$tsne@cell.embeddings, cluster=seurat_MD@ident, PC1=sc_proj_pooled.pc$MD)
+p_md=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=PC1), data = df_pc1.pooled_md) + scale_color_gradientn(colours = col_pc1) + geom_point(size=.6) + ggtitle("Prefrontal") + theme_classic() + theme(plot.title = element_text(hjust = 0.5)) + labs(x=NULL,y=NULL) 
+
+df_pc1.pooled_mgb=data.frame(seurat_MGB@dr$tsne@cell.embeddings, cluster=seurat_MGB@ident, PC1=sc_proj_pooled.pc$MGB)
+p_mgb=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=PC1), data = df_pc1.pooled_mgb) + scale_color_gradientn(colours = col_pc1) + geom_point(size=.6) + ggtitle("Auditory") + theme_classic() + theme(plot.title = element_text(hjust = 0.5)) + labs(x=NULL,y=NULL) 
+
+df_pc1.pooled_lglp=data.frame(seurat_LGLP@dr$tsne@cell.embeddings, cluster=seurat_LGLP@ident, PC1=sc_proj_pooled.pc$LGLP)
+p_lglp=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=PC1), data = df_pc1.pooled_lglp) + scale_color_gradientn(colours = col_pc1) + geom_point(size=.6) + ggtitle("Visual") + theme_classic() + theme(plot.title = element_text(hjust = 0.5)) + labs(x=NULL,y=NULL) 
+
+#plot all 5 projection systems together
+gridExtra:::grid.arrange(p_val,p_vbpo,p_lglp,  p_mgb,p_md,  nrow=5, ncol=1)
+
+```
+
+
+
+## Extract marker genes
+
+For joint clusters
+
+```{r, markers_joint}
+
+region.ord.pc1.sc_all=rev(levels(seurat_all@ident)[order(tapply(sc_proj_pooled.pc1, seurat_all@ident, mean))])
+
+sc_all.markers <- FindAllMarkers(object = seurat_all, only.pos = TRUE, min.pct = 0.8, thresh.use = .5)
+sc_all.markers$cluster_name=factor(plyr::mapvalues(sc_all.markers$cluster,from = region.ord.pc1.sc_all,to = paste("cluster",1:9,sep="_")), levels = paste("cluster",1:9,sep="_"))
+sc_all.top20 <- sc_all.markers %>% group_by(cluster_name) %>% filter(avg_logFC>.5, p_val_adj<10^-5) %>% top_n(20, desc(p_val)) %>% arrange(cluster_name)
+
+
+```
+
+For clusters by projection
+
+```{r, markers_byProj}
+VAL.markers <- FindAllMarkers(object = seurat_VAL, only.pos = TRUE, min.pct = 0.5, thresh.use = .5)
+VBPO.markers <- FindAllMarkers(object = seurat_VBPO, only.pos = TRUE, min.pct = 0.5, thresh.use = .5)
+LGLP.markers <- FindAllMarkers(object = seurat_LGLP, only.pos = TRUE, min.pct = 0.5, thresh.use = .5)
+MGB.markers <- FindAllMarkers(object = seurat_MGB, only.pos = TRUE, min.pct = 0.5, thresh.use = .5)
+MD.markers <- FindAllMarkers(object = seurat_MD, only.pos = TRUE, min.pct = 0.5, thresh.use = .5)
+
+library(dplyr)
+VAL.top20 <- VAL.markers %>% group_by(cluster) %>% filter(avg_logFC>.5, p_val_adj<10^-5) %>% top_n(20, avg_logFC)
+VBPO.top20 <- VBPO.markers %>% group_by(cluster) %>% filter(avg_logFC>.5, p_val_adj<10^-5) %>% top_n(20, avg_logFC)
+MD.top20 <- MD.markers %>% group_by(cluster) %>% filter(avg_logFC>.5, p_val_adj<10^-5) %>% top_n(20, avg_logFC)
+MGB.top20 <- MGB.markers %>% group_by(cluster) %>% filter(avg_logFC>.5, p_val_adj<10^-5) %>% top_n(20, avg_logFC)
+LGLP.top20 <- LGLP.markers %>% group_by(cluster) %>% filter(avg_logFC>.5, p_val_adj<10^-5) %>% top_n(20, avg_logFC)
+
+VAL.top20$cluster=factor(as.character(plyr:::mapvalues(VAL.top20$cluster,0:3,paste("Mot",c(3:1,4),sep="_"))))
+VBPO.top20$cluster=factor(as.character(plyr:::mapvalues(VBPO.top20$cluster,c(1,0,2),paste("Som",1:3,sep="_"))))
+MD.top20$cluster=factor(as.character(plyr:::mapvalues(MD.top20$cluster,c(3,1,0,2),paste("Pfr",1:4,sep="_"))))
+MGB.top20$cluster=factor(as.character(plyr:::mapvalues(MGB.top20$cluster,c(1,0,2),paste("Aud",1:3,sep="_"))))
+LGLP.top20$cluster=factor(as.character(plyr:::mapvalues(LGLP.top20$cluster,0:2,paste("Vis",c(2,3,1),sep="_"))))
+
+sc_marker_table=data.frame(rbind(VAL.top20,VBPO.top20,LGLP.top20,MGB.top20,MD.top20))
+sc_marker_table=sc_marker_table[order(sc_marker_table$cluster),]
+
+# combine markers, mean CPM per cluster
+cpm_sc_mean=data.frame(t(apply(sc_counts.norm_f[,!idx_odc],1,function(x){tapply(x, sc_metadata_f$cluster[!idx_odc], mean)})))
+cpm_sc_mean_joint=data.frame(t(apply(sc_counts.norm_f[,!idx_odc],1,function(x){tapply(x, sc_metadata_f$cluster_joint[!idx_odc], mean)})))
+cpm_sc_mean_all=data.frame(cpm_sc_mean,cpm_sc_mean_joint)
+markergenes=union(sc_marker_table$gene, sc_all.top20$gene)
+markergenes=markergenes[!duplicated(markergenes)]
+cpm_sc_mean_markers=round(cpm_sc_mean_all[markergenes,],digits = 2)
+
+```
+
+## Joint clustering visualization
+
+tSNEs with all cells together
+
+```{r,}
+
+# rename the clusters based on PC1 ordering
+region.ord.pc1.sc_all=rev(levels(seurat_all@ident)[order(tapply(sc_proj_pooled.pc1, seurat_all@ident, mean))])
+names_sc_all=plyr::mapvalues(seurat_all@ident, from = region.ord.pc1.sc_all, to = paste("cluster",1:9,sep="_"))
+names_sc_all=factor(names_sc_all,levels = levels(names_sc_all)[order(levels(names_sc_all))])
+
+#define colors, projections, and mapped PC1 score
+palette_set1=RColorBrewer::brewer.pal(9,"Set1")
+col_scall=c(palette_set1[c(2,3,4)],RColorBrewer::brewer.pal(8,"Dark2")[4],palette_set1[c(1,5)],"salmon",palette_set1[c(7,9)])
+
+#tSNEs for clusters
+df_tsne_all=data.frame(seurat_all@dr$tsne@cell.embeddings, cluster=names_sc_all, projection=sc_metadata_f$sample_names[!idx_odc], PC1=sc_proj_pooled.pc1)
+
+p_tsne_clust_all=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=cluster), data = df_tsne_all) + geom_point(aes(colour=cluster), size=.6) + scale_color_manual(values = col_scall) + theme_classic()
+
+p_tsne_proj_all=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=projection), data = df_tsne_all) + geom_point(aes(colour=projection), size=.6) + theme_classic()
+
+p_tsne_pc1proj_all=ggplot(aes(x=tSNE_1, y=tSNE_2), data = df_tsne_all) + geom_point(aes(colour=PC1), size=.6) + scale_color_gradientn(colours = col_pc1, guide_colourbar(title="PC1")) +theme_classic()
+
+leg_tsne_clust_all=lemon::g_legend(p_tsne_clust_all) #isolate legend
+p_tsne_clust_all=p_tsne_clust_all+theme(legend.position = "none")
+leg_tsne_proj_all=lemon::g_legend(p_tsne_proj_all) #isolate legend
+p_tsne_proj_all=p_tsne_proj_all+theme(legend.position = "none")
+leg_tsne_pc1proj_all=lemon::g_legend(p_tsne_pc1proj_all) #isolate legend
+p_tsne_pc1proj_all=p_tsne_pc1proj_all+theme(legend.position = "none")
+
+#plot the 3 tSNEs together
+gridExtra::grid.arrange(p_tsne_pc1proj_all, leg_tsne_pc1proj_all, p_tsne_proj_all, leg_tsne_proj_all, p_tsne_clust_all, leg_tsne_clust_all, nrow=1, ncol=6, widths=c(1,.2,1,.4,1,.3))
+
+```
+
+Bubble plot (projections vs. clusters)
+
+```{r, bubble}
+
+#re-rename clusters 
+region.ord.pc1.sc_all=rev(levels(seurat_all@ident)[order(tapply(sc_proj_pooled.pc1, seurat_all@ident, mean))])
+names_sc_all=plyr::mapvalues(seurat_all@ident, from = region.ord.pc1.sc_all, to = 1:9)
+names_sc_all=factor(names_sc_all,levels = levels(names_sc_all)[order(levels(names_sc_all))])
+
+df_mapclust_scall=data.frame(table(sc_metadata_f$sample_names[!idx_odc], names_sc_all))
+colnames(df_mapclust_scall)=c("Projection","Cluster","Cell_no")
+df_mapclust_scall$Cluster=factor(df_mapclust_scall$Cluster, levels = levels(names_sc_all))
+df_mapclust_scall$Projection=factor(df_mapclust_scall$Projection, levels = rev(levels(df_mapclust_scall$Projection)))
+
+df_mapclust_scall$Cell_no[df_mapclust_scall$Cell_no==0]=NA
+
+#make bubble plot
+ggplot(data = df_mapclust_scall, aes(y=Projection,x=Cluster,size=Cell_no,fill=Cluster)) + geom_point(shape=21) + scale_fill_manual(values = col_scall,guide="none") +theme_bw() + scale_x_discrete(position = "top")#+ labs(x="",y="")
+
+```
+
+
+## Clustering by projection visualization
+
+tSNEs
+
+```{r, tsne_clust_byProj}
+
+#rename clusters
+clust_VAL=factor(as.character(plyr:::mapvalues(seurat_VAL@ident,0:3,paste("Mot",c(3:1,4),sep="_"))))
+clust_VBPO=factor(as.character(plyr:::mapvalues(seurat_VBPO@ident,c(1,0,2),paste("Som",1:3,sep="_"))))
+clust_MD=factor(as.character(plyr:::mapvalues(seurat_MD@ident,c(3,1,0,2),paste("Pfr",1:4,sep="_"))))
+clust_MGB=factor(as.character(plyr:::mapvalues(seurat_MGB@ident,c(1,0,2),paste("Aud",1:3,sep="_"))))
+clust_LGLP=factor(as.character(plyr:::mapvalues(seurat_LGLP@ident,0:2,paste("Vis",c(2,3,1),sep="_"))))
+
+#get CPMs
+cpm_VAL=sc_counts.norm_f[keep_cells, sc_metadata_f$sample_names=="Motor" & !idx_odc]
+cpm_VBPO=sc_counts.norm_f[keep_cells, sc_metadata_f$sample_names=="Somatosensory" & !idx_odc]
+cpm_MD=sc_counts.norm_f[keep_cells, sc_metadata_f$sample_names=="Prefrontal" & !idx_odc]
+cpm_MGB=sc_counts.norm_f[keep_cells, sc_metadata_f$sample_names=="Auditory" & !idx_odc]
+cpm_LGLP=sc_counts.norm_f[keep_cells, sc_metadata_f$sample_names=="Visual" & !idx_odc]
+
+#cell names
+names(clust_VAL)=colnames(cpm_VAL)
+names(clust_VBPO)=colnames(cpm_VBPO)
+names(clust_MD)=colnames(cpm_MD)
+names(clust_MGB)=colnames(cpm_MGB)
+names(clust_LGLP)=colnames(cpm_LGLP)
+
+#define colors
+col_mod=c(RColorBrewer::brewer.pal(9,"Set1")[c(2,4,1,5,7,3)],"salmon",RColorBrewer::brewer.pal(8,"Dark2")[4])
+
+#define theme
+mytheme=theme(plot.title = element_text(hjust = 0.5, size=18, face = "bold"), axis.title=element_text(size=14),  axis.text = element_text(colour="black", size=14), legend.text=element_text(size=16), legend.title = element_blank(), legend.position="none")
+
+#make tSNEs
+df_pc1.pooled_val=data.frame(seurat_VAL@dr$tsne@cell.embeddings, cluster=clust_VAL)
+p_val=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=cluster), data = df_pc1.pooled_val) + scale_color_manual(values = col_mod[1:4]) + geom_point() + theme_classic() + ggtitle("Motor") + mytheme
+
+df_pc1.pooled_vbpo=data.frame(seurat_VBPO@dr$tsne@cell.embeddings, cluster=clust_VBPO)
+p_vbpo=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=cluster), data = df_pc1.pooled_vbpo) + geom_point(aes(colour=cluster)) + scale_color_manual(values = col_mod[1:3]) + ggtitle("Somatosensory") + theme_classic() + mytheme
+
+df_pc1.pooled_md=data.frame(seurat_MD@dr$tsne@cell.embeddings, cluster=clust_MD)
+p_md=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=cluster), data = df_pc1.pooled_md) + geom_point(aes(colour=cluster)) + scale_color_manual(values = col_mod[c(2,3,7,4)]) + ggtitle("Prefrontal")  + theme_classic() + mytheme
+
+df_pc1.pooled_mgb=data.frame(seurat_MGB@dr$tsne@cell.embeddings, cluster=clust_MGB)
+p_mgb=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=cluster), data = df_pc1.pooled_mgb) + geom_point(aes(colour=cluster)) + scale_color_manual(values = col_mod[c(2,3,5)]) + ggtitle("Auditory")  + theme_classic() + mytheme
+
+df_pc1.pooled_lglp=data.frame(seurat_LGLP@dr$tsne@cell.embeddings, cluster=clust_LGLP)
+p_lglp=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=cluster), data = df_pc1.pooled_lglp) + geom_point(aes(colour=cluster)) + scale_color_manual(values = col_mod[c(1,8,3)]) + ggtitle("Visual")  + theme_classic() + mytheme
+
+#plot all 5 tSNEs together
+gridExtra:::grid.arrange(p_val,p_vbpo,p_lglp,p_mgb,p_md, nrow=1, ncol=5)
+
+```
+
+
+Violin plots
+
+```{r, violin}
+
+# pottery plot function adapted from Allen (thanks to Vilas Menon & Lucas Gray)
+
+pottery_plot <- function(genes=c("Tnnt1","Necab1","Calb2","Slc17a6"),clusters=1:5,
+                         data_source="internal",
+                         anno_source="internal",
+                         logscale=F,
+                         fontsize=7,labelheight=25) {
+  require(dplyr)
+  require(ggplot2)
+  
+  genes <- rev(genes)
+  if(data_source[1] == "internal") {
+    data<-rpkm
+    all.anno<-anno
+  } else {
+    data<-data_source
+    all.anno<-anno_source	
+  } 
+  data <- data[genes,]
+  data <- data %>% 
+    #select(-1) %>% 
+    t() %>% 
+    as.data.frame()
+  data <- data %>%
+    mutate(sample_id=row.names(data)) %>%
+    select(one_of(c("sample_id",genes)))
+  
+  #Calculate the height of the label:
+  labheight <- length(genes)*(labelheight/100)/(1-labelheight/100)
+  
+  # Build the maximum value labels for the right edge
+  max.rect <- data.frame(xmin=length(clusters)+0.5,xmax=length(clusters)+2,
+                         ymin=1,ymax=length(genes)+1+labheight)
+  max.vals <- data %>% select(-sample_id) %>% summarise_all(funs(max)) %>% unlist()
+  max.labels <- data.frame(x=length(clusters)+0.5,y=1:length(genes)+0.5,label=round(max.vals))
+  #label=sci_label(max.vals))
+  max.header <- data.frame(x=length(clusters)+1.5,y=length(genes)+1,label="Max. CPM")
+  
+  # Filter and order the rows
+  data <- left_join(data,all.anno,by="sample_id") %>%
+    filter(final_id %in% clusters) %>%
+    arrange(final_id)
+  
+  # Scale the data
+  for(i in 1:length(genes)) {
+    gene <- genes[i]
+    if(logscale) {
+      data[gene] <- log10(data[gene]+1)/log10(max(data[gene])+1)*0.9 + i
+    } else {
+      data[gene] <- data[gene]/max(data[gene])*0.9 + i
+    }  
+  }
+  
+  cluster_positions <- data %>%
+    select(final_id) %>%
+    unique() %>%
+    mutate(xpos=1:n())
+  
+  data <- data %>% left_join(cluster_positions,by="final_id")
+  
+  # Variance injection - due to a bug, geom_violin requires some variance, so I add a vanishingly small random number to each data value
+  data[genes] <- data[genes] + runif(nrow(data),0,0.00001)
+  
+  cluster.data <- data %>%
+    select(final_label,final_color,final_id,xpos) %>%
+    group_by(final_label,final_color,final_id,xpos) %>%
+    summarise(cn=n()) %>%
+    as.data.frame(stringsAsFactors=F) %>%
+    arrange(final_id) %>%
+    mutate(labely=length(genes) + 1.1,
+           cny=length(genes) + 0.9 + labheight)
+  
+  hline.frame <- data.frame(y=seq(1,length(genes)+1,1))
+  xlab.rect <- data.frame(xmin=seq(0.5,length(clusters)-0.5,1),xmax=seq(1.5,length(clusters)+0.5,1),ymin=length(genes)+1,ymax=length(genes)+1+labheight,color=cluster.data$final_color)
+  
+  p <- ggplot(data) +
+    scale_fill_identity() +
+    geom_hline(data=hline.frame,aes(yintercept=y),size=0.2) +
+    geom_rect(data=xlab.rect,aes(xmin=xmin,ymin=ymin,xmax=xmax,ymax=ymax,fill=color)) +
+    geom_text(data=cluster.data,aes(y=labely,x=xpos,label=final_label),angle=90,hjust=0,vjust=0.35,size=pt2mm(fontsize)) +
+    geom_text(data=cluster.data,aes(y=cny,x=xpos,label=cn,size=40)) +
+    scale_y_continuous("",breaks=1:length(genes)+0.5,labels=genes,expand=c(0,0)) +
+    scale_x_continuous("",expand=c(0,0)) +
+    theme_classic(fontsize) +
+    theme(axis.text = element_text(size=rel(1)),
+          axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          legend.position = "none")
+  
+  # plot the violins for each gene
+  for(i in 1:length(genes)) {
+    p <- p + geom_violin(data=data,aes_string(x="xpos",y=genes[i],fill="final_color"),scale="width",adjust=2)
+    p <- p + stat_summary(data=data,aes_string(x="xpos",y=genes[i]),fun.y="median",fun.ymin="median",fun.ymax="median",geom="point",size=1.3)
+  }
+  
+  return(p)
+}
+
+#make annotations for pottery plot
+anno_VAL=data.frame(sample_id=names(seurat_VAL@ident), final_id=clust_VAL, final_label=clust_VAL, final_color=plyr:::mapvalues(clust_VAL,levels(clust_VAL),col_mod[1:4]))
+anno_VBPO=data.frame(sample_id=names(seurat_VBPO@ident), final_id=clust_VBPO, final_label=clust_VBPO, final_color=plyr:::mapvalues(clust_VBPO,levels(clust_VBPO),col_mod[1:3]))
+anno_MD=data.frame(sample_id=names(seurat_MD@ident), final_id=clust_MD, final_label=clust_MD, final_color=plyr:::mapvalues(clust_MD,levels(clust_MD),col_mod[c(2,3,7,4)]))
+anno_MGB=data.frame(sample_id=names(seurat_MGB@ident), final_id=clust_MGB, final_label=clust_MGB, final_color=plyr:::mapvalues(clust_MGB,levels(clust_MGB),col_mod[c(2,3,5)]))
+anno_LGLP=data.frame(sample_id=names(seurat_LGLP@ident), final_id=clust_LGLP, final_label=clust_LGLP, final_color=plyr:::mapvalues(clust_LGLP,levels(clust_LGLP),col_mod[c(1,8,3)]))
+
+#manually selected marker genes
+good_genes=c("Pvalb","Kcnab3","Car4","Tnnt1","Opcml","Hpca","Foxp1","Necab1","Calb1","Calb2","Scn3b","Snca","Cbln1","Nts","Nrgn","Bdnf","Col12a1","Ctxn1")
+
+pp_val=pottery_plot(genes = good_genes, data_source = cpm_VAL, anno_source = anno_VAL, clusters = levels(clust_VAL),logscale=F,fontsize=12,labelheight=16)+ ggtitle("Motor") + theme(plot.title = element_text(size=16, hjust = .5))
+pp_vbpo=pottery_plot(genes = good_genes, data_source = cpm_VBPO, anno_source = anno_VBPO, clusters =levels(clust_VBPO),logscale=F,fontsize=12,labelheight=16)+ ggtitle("Somatosensory") + theme(plot.title = element_text(size=16, hjust = .5))
+pp_md=pottery_plot(genes = good_genes, data_source = cpm_MD, anno_source = anno_MD, clusters = levels(clust_MD),logscale=F,fontsize=12,labelheight=16)+ ggtitle("Prefrontal") + theme(plot.title = element_text(size=16, hjust = .5))
+pp_mgb=pottery_plot(genes = good_genes, data_source = cpm_MGB, anno_source = anno_MGB, clusters = levels(clust_MGB),logscale=F,fontsize=12,labelheight=16)+ ggtitle("Auditory") + theme(plot.title = element_text(size=16, hjust = .5))
+pp_lglp=pottery_plot(genes = good_genes, data_source = cpm_LGLP, anno_source = anno_LGLP, clusters = levels(clust_LGLP),logscale=F,fontsize=12,labelheight=16)+ ggtitle("Visual") + theme(plot.title = element_text(size=16, hjust = .5))
+
+#plot the violin plots for all projections
+gridExtra:::grid.arrange(pp_val,pp_vbpo,pp_lglp,pp_mgb,pp_md, ncol=5)
+
+```
+
+
+## Projection on PC1 swarmplots
+
+Swarmplot for each projection
+
+```{r, pc1_swarm}
+
+df_sc2pooled_pc=data.frame(sc_proj_pooled.pc, Projection=sc_metadata_f$sample_names[!idx_odc], batch=sc_metadata_f$batch[!idx_odc], cluster=sc_metadata_f$cluster[!idx_odc])
+
+df_sc2pooled_pc_revlev=df_sc2pooled_pc
+df_sc2pooled_pc_revlev$Projection=factor(df_sc2pooled_pc$Projection, levels = rev(levels(df_sc2pooled_pc$Projection)))
+df_sc2pooled_pc_revlev$cluster=factor(df_sc2pooled_pc$cluster, levels = rev(levels(df_sc2pooled_pc$cluster)))
+
+#swarmplot for the 5 projection types, colored by cluster
+ggplot(aes(x=Projection, y=PC1, colour=cluster), data = df_sc2pooled_pc_revlev) + ggbeeswarm::geom_quasirandom(size=1) + labs(x=NULL, y="pooled-cell PC1 mapping") + guides(fill=FALSE) + theme_classic() + scale_colour_manual(values = col_mod[rev(c(1:4,1:3,1,8,3,2,3,5,2,3,7,4))]) + theme(legend.position="none",axis.text=element_text(colour="black",size=16))
+
+#swarmplot with each cluster plotted separately
+ggplot(aes(x=cluster, y=PC1, colour=cluster), data = df_sc2pooled_pc_revlev) + ggbeeswarm::geom_quasirandom(show.legend = F, size=.25) + labs(x=NULL, y="pooled-cell PC1 mapping") + coord_flip() + guides(fill=FALSE) + theme_classic() + scale_colour_manual(values = rev(col_mod_all)) + facet_wrap(~Projection, scales = "free_y", ncol=1)
+dev.off()
+
+```
+
+
+## Intermediate cell identities
+
+3d plot of 3 marker genes
+
+```{r, 3d}
+
+#select 3 genes (marker genes, also the ones used for FISH)
+cpm_sc_cabuff=data.frame(t(sc_counts.norm_f[c("Tnnt1","Necab1","Calb2"),!idx_odc]))
+
+#define 3 dmensions and colors
+x <- cpm_sc_cabuff$Tnnt1
+y <- cpm_sc_cabuff$Necab1
+z <- cpm_sc_cabuff$Calb2
+
+K<- as.vector(sc_proj_pooled.pc1)
+
+#make 3d plot
+plot3D::scatter3D(x , y , z , colvar = K, col=rev(matlab::jet.colors(200)),
+          pch = 16, cex = .5, xlab = "Tnnt1 CPM", ylab = "Necab1 CPM",
+          zlab = "Calb2 CPM", clab = c("Pooled-cell PC1 projection"),
+          ticktype = "detailed", theta=135, phi=15,
+          colkey = list(length = 0.5, width = 0.5, cex.clab = 0.75))
+
+```
+
+
+Random forest classification
+
+```{r, rf}
+
+library(caret)
+
+#5-fold cross-validation
+ctrl=trainControl(method = 'cv', number = 5, savePred=T, classProb=T, verboseIter = TRUE)
+
+library(doParallel)
+cl <- makePSOCKcluster(4)
+registerDoParallel(cl)
+
+#run Random Forest classifier to classify clusters in each projection system using the same genes as used for clustering
+rf.VAL=train(classes~., data=data.frame(t(seurat_VAL@scale.data[seurat_VAL@var.genes,]), classes=clust_VAL), method = "rf", tuneGrid=data.frame(mtry=500), trControl = ctrl, verbose=T)
+rf.VBPO=train(classes~., data=data.frame(t(seurat_VBPO@scale.data[seurat_VBPO@var.genes,]), classes=clust_VBPO), method = "rf", tuneGrid=data.frame(mtry=500), trControl = ctrl, verbose=T)
+rf.LGLP=train(classes~., data=data.frame(t(seurat_LGLP@scale.data[seurat_LGLP@var.genes,]), classes=clust_LGLP), method = "rf", tuneGrid=data.frame(mtry=500), trControl = ctrl, verbose=T)
+rf.MGB=train(classes~., data=data.frame(t(seurat_MGB@scale.data[seurat_MGB@var.genes,]), classes=clust_MGB), method = "rf", tuneGrid=data.frame(mtry=500), trControl = ctrl, verbose=T)
+rf.MD=train(classes~., data=data.frame(t(seurat_MD@scale.data[seurat_MD@var.genes,]), classes=clust_MD), method = "rf", tuneGrid=data.frame(mtry=500), trControl = ctrl, verbose=T)
+
+#class probabilities (based on vote from 500 trees)
+#rows need to be reordered
+prob.rf.val=apply(rf.val$pred[order(rf.VAL$pred$rowIndex),],1,function(x){x[x[1]]})
+prob.rf.VBPO=apply(rf.VBPO$pred[order(rf.VBPO$pred$rowIndex),],1,function(x){x[x[1]]})
+prob.rf.LGLP=apply(rf.LGLP$pred[order(rf.LGLP$pred$rowIndex),],1,function(x){x[x[1]]})
+prob.rf.MGB=apply(rf.MGB$pred[order(rf.MGB$pred$rowIndex),],1,function(x){x[x[1]]})
+prob.rf.MD=apply(rf.MD$pred[order(rf.MD$pred$rowIndex),],1,function(x){x[x[1]]})
+
+#plot tSNE as before, but now use class probabilities as alpha value
+df_pc1.pooled_val=data.frame(seurat_VAL@dr$tsne@cell.embeddings, cluster=clust_VAL, prob=prob.rf.val)
+p_val=ggplot(aes(x=tSNE_1, y=tSNE_2, color=cluster, alpha=prob), data = df_pc1.pooled_val) + scale_color_manual(values = col_mod[1:4]) + geom_point(pch=16) + theme_classic() + ggtitle("Motor") + mytheme
+
+df_pc1.pooled_vbpo=data.frame(seurat_VBPO@dr$tsne@cell.embeddings, cluster=clust_VBPO, prob=prob.rf.VBPO)
+p_vbpo=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=cluster, alpha=prob), data = df_pc1.pooled_vbpo) + geom_point(aes(colour=cluster), pch=16) + scale_color_manual(values = col_mod[1:3]) + ggtitle("Somatosensory") + theme_classic() + mytheme
+
+df_pc1.pooled_md=data.frame(seurat_MD@dr$tsne@cell.embeddings, cluster=clust_MD, prob=prob.rf.MD)
+p_md=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=cluster, alpha=prob), data = df_pc1.pooled_md) + geom_point(aes(colour=cluster), pch=16) + scale_color_manual(values = col_mod[c(2,3,7,4)]) + ggtitle("Prefrontal")  + theme_classic() + mytheme
+
+df_pc1.pooled_mgb=data.frame(seurat_MGB@dr$tsne@cell.embeddings, cluster=clust_MGB, prob=prob.rf.MGB)
+p_mgb=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=cluster, alpha=prob), data = df_pc1.pooled_mgb) + geom_point(aes(colour=cluster), pch=16) + scale_color_manual(values = col_mod[c(2,3,5)]) + ggtitle("Auditory")  + theme_classic() + mytheme
+
+df_pc1.pooled_lglp=data.frame(seurat_LGLP@dr$tsne@cell.embeddings, cluster=clust_LGLP, prob=prob.rf.LGLP)
+p_lglp=ggplot(aes(x=tSNE_1, y=tSNE_2, colour=cluster, alpha=prob), data = df_pc1.pooled_lglp) + geom_point(aes(colour=cluster),pch=16) + scale_color_manual(values = col_mod[c(1,8,3)]) + ggtitle("Visual")  + theme_classic() + mytheme
+
+#plot the tSNEs together with alpha corresponding to RF class probabilities
+gridExtra::grid.arrange(p_val,p_vbpo,p_lglp,p_mgb,p_md,nrow=2,ncol=3)
+
+```
+

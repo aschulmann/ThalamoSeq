@@ -1,0 +1,1099 @@
+---
+title: "ThalamoSeq nuclei data"
+author: "Anton Schulmann"
+date: "July, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Differential gene expression
+
+```{r, dge, eval=FALSE}
+
+## read in data
+#d_tseq_nuclei # counts (all annotated genes), gene metadata
+#tseq_metadata_nuclei # all metadata
+#group_nuclei # groups (also column of metadata)
+
+# TPMs
+rpkm_tseq_nuclei=rpkm(d_tseq_nuclei, normalized.lib.sizes = F)
+tpm_tseq_nuclei=10^6*t(t(rpkm_tseq_nuclei)/rowSums(t(rpkm_tseq_nuclei)))
+keep10 <- rowSums(tpm_tseq_nuclei>10) >= 3
+d_tseq_nuclei=DGEList(counts = d_tseq_nuclei$counts[keep10nomt,], genes = d_tseq_nuclei$genes[keep10nomt,])
+tpm_mean=data.frame(t(apply(tpm_tseq_nuclei,1,function(x){tapply(x, group_nuclei, mean)})))
+
+#edgeR: fit NB model
+library(edgeR)
+d_tseq_nuclei <- calcNormFactors(d_tseq_nuclei)
+design <- model.matrix(~ 0 + group_nuclei)
+colnames(design) = gsub("group_nuclei|tseq_metadata_nuclei\\$","",colnames(design))
+d_tseq_nuclei <- estimateGLMCommonDisp(d_tseq_nuclei, design)
+d_tseq_nuclei <- estimateGLMTrendedDisp(d_tseq_nuclei,design)
+d_tseq_nuclei <- estimateGLMTagwiseDisp(d_tseq_nuclei,design,trend=TRUE)
+fit_tseq_nuclei <- glmFit(d_tseq_nuclei, design)
+
+## ANODEV (one-way ANOVA-like test for GLMs)
+group_nuclei=factor(group_nuclei)
+comb=combn(levels(group_nuclei),2)
+con_anodev=list()
+for (i in 1:(length(levels(as.factor(make.names(group_nuclei))))-1)){
+  mycon=paste(comb[1,i],comb[2,i], sep="-")
+  con_anodev[[i]]=makeContrasts(eval(parse(text=mycon)), levels = design)
+}
+
+lrt_anodev=glmLRT(fit_tseq_nuclei, contrast = data.frame(con_anodev))
+anodev_top500=as.character(topTags(lrt_anodev,n=500)[,1]$table$Geneid)
+
+#VST (DESeq2): variance stabilizing transformation
+colData_nuclei=tseq_metadata_nuclei
+rownames(colData_nuclei)=colData_nuclei$filename
+dds_nuclei=DESeqDataSetFromMatrix(countData = d_tseq_nuclei$counts, colData = colData_nuclei, design = ~shortname2)
+vst_nuclei=varianceStabilizingTransformation(dds_nuclei)
+vst_nuclei=assay(vst_nuclei)
+
+vst_mean=data.frame(t(apply(vst_nuclei,1,function(x){tapply(x, group_nuclei, mean)})))
+dup_genes=d_tseq_nuclei$genes$gene_symbol %in% d_tseq_nuclei$genes$gene_symbol[duplicated(d_tseq_nuclei$genes$gene_symbol)]
+vst_mean=vst_mean[!dup_genes,]
+rownames(vst_mean)=d_tseq_nuclei$genes$gene_symbol[match(rownames(vst_mean),d_tseq_nuclei$genes$Geneid)]
+
+```
+
+
+## Unsupervised clustering
+
+Hierarchical clustering with Spearman's correlation distance
+
+```{r, clust}
+
+vst_mean=data.frame(t(apply(vst_nuclei,1,function(x){tapply(x, group_nuclei, mean)})))
+vst_anodev500_mean=vst_mean[anodev_top500,]
+
+clust_spearman=as.dendrogram(hclust(as.dist(1-cor(vst_anodev500_mean,method = "spearman"))))
+col_clust_spearman_grp=dendextend::color_labels(dendextend::color_branches(clust_spearman, 5, col = c("#A6761D","#ECB64C","gray50","#6391BA","#CE4A45")), 5, col = c("#A6761D","#ECB64C","gray50","#6391BA","#CE4A45"))
+
+#plot colored dendorgram
+plot(col_clust_spearman_grp)
+
+#define groups at the level of five branches
+clust_spearman_grp=cutree(clust_spearman, 5)
+col_hclust=group_nuclei
+col_hclust=sub('^AD','gray50',col_hclust)
+col_hclust=sub('^RE','#A6761D',col_hclust)
+col_hclust=sub('AM|IAD|LP|^MD|PO|VA|VM|VPMpc','#CE4A45',col_hclust)
+col_hclust=sub('AV|LD|LGd|VB|VL','#6391BA',col_hclust)
+col_hclust=sub('CL|CM|IMD|PCN|PF|PVT|SPA','#ECB64C',col_hclust)
+
+grp_hclust=group_nuclei
+grp_hclust=sub('AM|IAD|LP|^MD|PO|VA|VM|VPMpc','Secondary',grp_hclust)
+grp_hclust=sub('AV|LD|LGd|VB|VL','Primary',grp_hclust)
+grp_hclust=sub('CL|CM|IMD|PCN|PF|PVT|SPA','Tertiary',grp_hclust)
+
+```
+
+
+Correlation heatmap
+
+```{r, cor, eval=FALSE}
+
+cor_vst_anodev500=cor(vst_anodev500_mean, method = 'spearman')
+
+regions_default=c("RE","SPA","IMD","PVT","CL","PF","CM","PCN","AD","AV","LD","VL","VB","LGd","VPMpc","MD","PO","LP","VA","VM","AM","IAD")
+regions_reord=rev(c("RE","SPA","IMD","PVT","CL","PF","CM","PCN","VPMpc","MD","LP","PO","AM","IAD","VA","VM","AV","LD","VL","LGd","VB","AD"))
+
+Heatmap(cor_vst_anodev500[,regions_default], col=circlize::colorRamp2(seq(min(cor_vst_anodev500),1, length = 10), rev(RColorBrewer::brewer.pal(10, "Spectral"))), cluster_rows = col_clust_spearman_grp, cluster_columns = F, row_dend_width = unit(3,'cm'), heatmap_legend_param = list(color_bar="continuous", title=expression(paste(rho,"(Spearman)"))))
+
+Heatmap(cor_vst_anodev500[regions_reord,regions_reord], col=circlize::colorRamp2(seq(min(cor_vst_anodev500),1, length = 10), rev(RColorBrewer::brewer.pal(10, "Spectral"))), cluster_rows = F, cluster_columns = F, row_dend_width = unit(3,'cm'), heatmap_legend_param = list(color_bar="continuous", title=expression(paste(rho,"(Spearman)"))))
+
+```
+
+## Qauality control
+
+Contamination
+
+```{r, glia_markers}
+
+rownames(tpm_tseq_nuclei)=genes_M13$gene_symbol[match(rownames(tpm_tseq_nuclei),genes_M13$Geneid)]
+plot(tpm_tseq_nuclei["Gfap",])
+
+df_glia=data.frame(t(tpm_tseq_nuclei[c("Gfap","Aldh1l1","Cx3cr1","Csf1r","Mbp","Mog","Hba-a1","Hba-a2"),]), group=group_nuclei, samples=make.unique(as.character(group_nuclei)), check.names = F)
+df_glia=reshape2::melt(df_glia, check.names = F)
+colnames(df_glia)=c("group","sample","gene","TPM")
+df_glia$Type=plyr:::mapvalues(df_glia$gene,c("Gfap","Aldh1l1","Cx3cr1","Csf1r","Mbp","Mog","Hba-a1","Hba-a2"), c(rep("Astroglia",2),rep("Microglia",2),rep("Oligodendroglia",2),rep("Erythrocytes",2)))
+
+#plot bar TPMs for glial markers all samples
+ggplot(df_glia, aes(x=sample, y=TPM, fill=Type)) + xlab("") + scale_fill_brewer(palette="Pastel1") + geom_bar(position=position_dodge(), stat="identity",colour="black") + classic_theme + facet_grid(gene~group,scales="free",space = "free_x", switch = "x") + theme(axis.text.x = element_blank(),strip.placement.x = "outside", strip.text.x =element_text(angle = 90, hjust = .5, vjust = 1))
+
+```
+
+
+ERCC
+
+```{r, ercc}
+
+## read in ercc info
+#ercc_anno
+#ercc_size
+
+ercc_tseq=data.frame(TPM=rowMeans(tpm_tseq_nuclei[1:92,]),sd=apply(tpm_tseq_nuclei[1:92,],1,sd),detected=rowSums(tpm_tseq_nuclei[1:92,]!=0)/120,conc=ercc_anno$concentration.in.Mix.1..attomoles.ul.[match(rownames(tpm_tseq_nuclei)[1:92], ercc_anno$ERCC.ID)])
+ercc_tseq$molecules=ercc_tseq$conc*602214.15*10^-5
+ercc_tseq$sem=ercc_tseq$sd/sqrt(120)
+
+s.lm_ercc_tseq=summary(lm(data = ercc_tseq, formula = log10(TPM+.01) ~ log10(molecules)))
+p_ercc_tseq1=ggplot(data = ercc_tseq, aes(x=log10(molecules),y=log10(TPM+.01))) + geom_point() +geom_smooth(method = "lm") + ggtitle("ERCC spike-in levels") + theme_bw() + theme(plot.title = element_text(hjust = 0.5)) + annotate("text",x=c(-1,-1),y=c(3.5,4),label=list(bquote(p==.(format(s.lm_ercc_tseq$coefficients[2,4], digits = 3))),bquote(R^2==.(format(s.lm_ercc_tseq$r.squared,digits=3)))), parse=T,hjust=0)
+s.glm_ercc_tseq=summary(glm(data = ercc_tseq, formula = detected ~ log10(molecules), family = "binomial"))
+p_ercc_tseq2=ggplot(data = ercc_tseq, aes(x=log10(molecules),y=detected)) + geom_point() + geom_smooth(method = "glm",method.args = list(family = "binomial")) + ggtitle("ERCC spike-in detection") + theme_bw() + theme(plot.title = element_text(hjust = 0.5))
+
+#plot ERCC levels and detection
+gridExtra::grid.arrange(p_ercc_tseq1,p_ercc_tseq2,ncol=2)
+
+```
+
+Heatmap of top 500 genes
+
+```{r, top500}
+
+library(ComplexHeatmap)
+Heatmap(t(scale(t(vst_anodev500_mean))),col=circlize::colorRamp2(seq(-3,3, length = 10), rev(RColorBrewer::brewer.pal(10, "RdBu"))), heatmap_legend_param = list(color_bar="continuous", title="Z-score"), show_row_names = F)
+
+```
+
+
+Transgenic validation
+
+```{r, tg_validation}
+
+## red in transgenic data
+#counts_nucleitg # counts for transgenics and corresponding nuclei
+#metadata_nucleitg # corresponding metadata
+
+vst_nucleitg=DESeq2:::varianceStabilizingTransformation(counts_nucleitg)
+col_tgfw=plyr:::mapvalues(labels_tgfw, from = c("AAV","DiI","Gpr26-Cre.KO250","Grp-Cre.KH288","Slc6a5-Cre.KF109"), to = c(brewer.pal(8,"Dark2")[c(1,5,2)],brewer.pal(9,"Set1")[c(1,4)]))
+names_tgfw=tseq_metadata_nucleitg$region
+
+# PCA function
+mypca = function(object, ntop = nrow(object), col = "black", labels = colnames(object), main = NULL, cex=1) 
+{
+  rv = apply(object,1,var)
+  select = order(rv, decreasing = TRUE)[1:ntop]
+  pca = prcomp(t(object[select,]))
+  percentVar = pca$sdev^2/sum(pca$sdev^2)
+  plot(pca$x[, 1], pca$x[, 2], col = as.character(col), main = main, pch="",
+       xlab = paste0("PC1: ", round(percentVar[1] * 100, digits = 1), "% variance"),
+       ylab = paste0("PC2: ", round(percentVar[2] * 100, digits = 1), "% variance"))
+  text(pca$x[, 1], pca$x[, 2], labels=labels, col = as.character(col), cex = cex)
+  pca$percentVar=percentVar
+  return(pca)
+}
+
+# plot PCA with top 500 genes with highest ariance
+pca_tgfw=mypca(vst_nucleitg, ntop = 500, col_tgfw, labels = names_tgfw)
+legend("topleft",legend = c("AAV","DiI","Gpr26-Cre.KO250","Grp-Cre.KH288","Slc6a5-Cre.KF109"), col = c(brewer.pal(8,"Dark2")[c(1,5,2)],brewer.pal(9,"Set1")[c(1,4)]), pch = 15, inset = .01, bty = "n")
+
+```
+
+
+## Core/Matrix comparison
+
+3 calcium buffer TPM plot
+
+```{r, cabuff}
+
+df_ca_buff=data.frame(t(tpm_ca_buff), region=group_nuclei)
+
+#plot bar plots with relicate dots for each nucleus
+ggpubr::ggbarplot(df_ca_buff, x = "region", y = "TPM", , fill="gray", position=position_dodge(), strip.position="right", facet.by = "gene", scales="free", add = c("mean_se", "jitter"), nrow=3) + theme_classic()+ theme(axis.text.x = element_text(angle = 90, vjust=.5, hjust = 1,colour=c(rep("#ECB64C",7),"#A6761D",rep("#CE4A45",8),"gray50",rep("#6391BA",5))),legend.position="none")
+
+```
+
+Major division unsupervised classification methods
+
+```{r, major_clust}
+
+clust_spearman_cut2=cutree(clust_spearman, 2)
+clust_kmeans_k2=kmeans(t(vst_anodev500_mean),2)$cluster
+clust_gmm_g2=mclust::densityMclust(data = t(vst_anodev500_mean), G = 2)$classification
+
+clust_major=data.frame(hclust=factor(clust_spearman_cut2),kmeans=factor(clust_kmeans_k2),gmm=factor(clust_gmm_g2))
+
+library(ComplexHeatmap)
+clust_bar=HeatmapAnnotation(df = clust_major[region.ord3,], which="column",annotation_legend_param  = list(color_bar="discrete"), col = list(hclust=c("1"="mediumseagreen","2"="#DE77AE"), kmeans=c("1"="#E78AC3","2"="#7FC97F"), gmm=c("1"="#66C2A5","2"="plum3")))
+
+#plot the bars illustrating the clustering
+draw(clust_bar,1:22)
+
+```
+
+
+## PCA
+
+PCA plot
+
+```{r, pca}
+
+# PCA function
+mypca = function(object, ntop = nrow(object), col = "black", labels = colnames(object), main = NULL, cex=1) 
+{
+  rv = apply(object,1,var)
+  select = order(rv, decreasing = TRUE)[1:ntop]
+  pca = prcomp(t(object[select,]))
+  percentVar = pca$sdev^2/sum(pca$sdev^2)
+  plot(pca$x[, 1], pca$x[, 2], col = as.character(col), main = main, pch="",
+       xlab = paste0("PC1: ", round(percentVar[1] * 100, digits = 1), "% variance"),
+       ylab = paste0("PC2: ", round(percentVar[2] * 100, digits = 1), "% variance"))
+  text(pca$x[, 1], pca$x[, 2], labels=labels, col = as.character(col), cex = cex)
+  pca$percentVar=percentVar
+  return(pca)
+}
+
+#plot PC1 and 2
+pca_anodev=mypca(vst_anodev500, col=col_hclust, labels = group_nuclei)
+
+```
+
+PCA scree plot & permutation
+
+```{r, scree}
+
+df_pcaVarPct=data.frame(PC=factor(1:10), pctVar=pca_anodev$percentVar[1:10], pctVar_cumulative=cumsum(pca_anodev$percentVar[1:10]))
+
+# plot scree (dots)
+ggplot(data=df_pcaVarPct, aes(x=PC,y=pctVar_cumulative)) + geom_point() +theme_bw() + ylim(0,1)
+
+#code for permutation scree plot adapted from
+#https://divingintogeneticsandgenomics.rbind.io/post/permute-test-for-pca-components/
+pca_eigeperm<- function(data, nperm = 1000){
+        pca_out<- prcomp(data)
+        eigenperm<- data.frame(matrix(NA, nperm, length(pca_out$sdev)))
+        n<- ncol(data)
+        data_i<- data.frame(matrix(NA, nrow(data), ncol(data)))
+        for (j in 1: nperm){
+        for (i in 1:n){
+                data_i[,i]<- sample(data[,i], replace = F)
+        }
+        pca.perm<- prcomp(data_i)
+        eigenperm[j,]<- pca.perm$sdev^2/sum(pca.perm$sdev^2)
+        }
+        colnames(eigenperm)<- colnames(pca_out$rotation)
+        eigenperm
+}
+
+pca_anodev_perm=pca_eigenperm(data = t(vst_anodev500), nperm = 1000)
+
+### scree plot
+
+df_pcaPerm=reshape2::melt(pca_anodev_perm[,1:10])
+colnames(df_pcaPerm)=c("PC","pctVar")
+df_pcaPerm$PC=factor(sub("PC","",df_pcaPerm$PC), levels=1:10)
+df_pcaPerm=data.frame(rbind(df_pcaVarPct[,1:2],df_pcaPerm))
+df_pcaPerm$data="permuted"; df_pcaPerm$data[1:10]="actual"
+
+df_pcaPerm_meansd=data.frame(PC=factor(1:10,levels=1:10),t(apply(pca_anodev_perm[,1:10],2,function(x){c(mean(x),sd(x))})))
+colnames(df_pcaPerm_meansd)=c("PC","pctVar","sd_pctVar")
+df_pcaPerm_meansd=data.frame(rbind(data.frame(df_pcaVarPct[,1:2],sd_pctVar=0),df_pcaPerm_meansd))
+df_pcaPerm_meansd$data=c(rep("actual",10),rep("permuted",10))
+df_pcaPerm_meansd[,2:3]=df_pcaPerm_meansd[,2:3] * 100
+
+#permutation scree plot
+ggplot(df_pcaPerm_meansd, aes(x=PC, y=pctVar, fill=data))  + 
+    geom_bar(position=position_dodge(), stat="identity", color="black") +
+    geom_errorbar(aes(ymin=pctVar-sd_pctVar*1.96, ymax=pctVar+sd_pctVar*1.96), width=.2, position=position_dodge(.9)) +
+    theme_bw() + ylab("% variance explained") + theme(axis.text=element_text(colour="black"))
+
+```
+
+Ordering on PC1
+
+```{r, pc_nuclei_ord}
+
+library(ggpubr)
+df_pos_pc_reorder=df_pos_pc
+df_pos_pc_reorder$nuclei=factor(df_pos_pc_reorder$nuclei, levels = names_pc[order(pos_pc[[1]])])
+pp_pc1=ggerrorplot(df_pos_pc_reorder, x="nuclei", y="PC1", add = "jitter", add.params = list(color=col_hclust), desc_stat = "none") +rotate_x_text(angle = 45, color = col_hclust1[names_pc[order(pos_pc[[1]])]]) + xlab("")
+
+
+df_pos_pc_reorder$nuclei=factor(df_pos_pc_reorder$nuclei, levels = names_pc[order(pos_pc[[2]])])
+pp_pc2=ggerrorplot(df_pos_pc_reorder, x="nuclei", y="PC2", add = "jitter", add.params = list(color=col_hclust), desc_stat = "none") +rotate_x_text(angle = 45, color = col_hclust1[names_pc[order(pos_pc[[2]])]]) + xlab("")
+
+# plot for PC1 and PC2
+gridExtra::grid.arrange(p_pc1, p_pc2, nrow=2)
+
+```
+
+MDS plot
+
+```{r, mds}
+
+#MDS plot function from edgeR is cmdscale with distances derived from top 500 genes with biggest logFC between each pair
+mds_nuclei=edgeR::plotMDS(d_tseq_nuclei, top = 500)
+plot(mds_nuclei$x,mds_nuclei$y, pch="", xlab = "Leading LogFC dim 1", ylab = "Leading LogFC dim 2")
+text(mds_nuclei$x,mds_nuclei$y, labels=group_nuclei, col = col_hclust)
+
+```
+
+## PC relationships to profiles, projections, anatomy
+
+F-statistic for profiles and projections
+
+```{r, pc_f_stat}
+
+# anova f-statistic for PC1-6 relationship to profiles
+pc_aov_profiles=list()
+for(i in 1:6){
+  a=summary(aov(pca_anodev$x[,i]~0+grp_hclust))
+  pc_aov_profiles[[i]]=c(F_statistic=a[[1]][1,4], p_value=a[[1]][1,5])
+}
+pc_aov_profiles=as.data.frame(pc_aov_profiles)
+colnames(pc_aov_profiles)=paste("PC",1:6,sep="")
+
+#same for projections but without striatum
+pc_aov_proj=list()
+for(i in 1:6){
+  a=summary(aov(pca_anodev$x[grp_proj!="Striatum",i]~0+grp_proj[grp_proj!="Striatum"]))
+  pc_aov_proj[[i]]=c(F_statistic=a[[1]][1,4], p_value=a[[1]][1,5])
+}
+pc_aov_proj=as.data.frame(pc_aov_proj)
+colnames(pc_aov_proj)=paste("PC",1:6,sep="")
+
+df_fstat=data.frame(rbind(t(pc_aov_profiles), t(pc_aov_proj)))
+df_fstat$PC=factor(c(1:6,1:6), levels = 1:6)
+df_fstat$group=c(rep("profiles",6),rep("projections",6))
+
+#plot for F-statistics
+ggplot(df_fstat, aes(x=PC, y=F_statistic, fill=group)) + scale_fill_manual(values = c("#74C476","#E78AC3")) + 
+    geom_bar(position=position_dodge(), stat="identity", color="black") +
+    theme_classic() + ylab("F-statistic") + theme(axis.text=element_text(colour="black"))
+
+#plot for corresponding p-values
+ggplot(df_fstat, aes(x=PC, y=log10(p_value), fill=group)) + scale_fill_brewer(palette = "Dark2") +
+    geom_bar(position=position_dodge(), stat="identity", color="black") +
+    theme_bw() + ylab("log10(ANOVA p-value)") + theme(axis.text=element_text(colour="black"))
+
+```
+
+PC relationship to profiles & projections
+
+```{pc_profile_projection}
+
+#order levels for profiles
+grp_hclust=factor(grp_hclust, levels = c("Primary","Secondary","Tertiary","RE","AD"))
+grp_proj=factor(grp_proj, levels = c("M1_Ctx","Barrel_Ctx","V1_Ctx","Insula_Ctx","lc_Orb_Ctx","Cg_Ctx","Rs_Ctx", "Striatum"))
+
+#test profiles (each group vs. entire dataset)
+profiles_wilcox=list()
+for(i in 1:6){
+  profiles_wilcox[[paste0("PC",i)]]=compare_means(data=data.frame(PC=pca_anodev$x[,i],grp=grp_hclust),PC~grp, ref.group = ".all.")
+  profiles_wilcox[[paste0("PC",i)]]$p.adj=p.adjust(profiles_wilcox[[paste0("PC",i)]]$p, method = "BH")
+  profiles_wilcox[[paste0("PC",i)]][,1]=paste0("PC",i)
+}
+
+profiles_wilcox=as.data.frame(do.call("rbind", profiles_wilcox))
+rownames(profiles_wilcox)=NULL
+profiles_wilcox=profiles_wilcox[,-c(6,8)]
+colnames(profiles_wilcox)[1]="PC"
+
+#test projections
+proj_wilcox=list()
+for(i in 1:6){
+  proj_wilcox[[paste0("PC",i)]]=compare_means(data=data.frame(PC=pca_anodev$x[grp_proj!="Striatum",i],grp=grp_proj[grp_proj!="Striatum"]),PC~grp, ref.group = ".all.")
+  proj_wilcox[[paste0("PC",i)]]$p.adj=p.adjust(proj_wilcox[[paste0("PC",i)]]$p, method = "BH")
+  proj_wilcox[[paste0("PC",i)]][,1]=paste0("PC",i)
+}
+proj_wilcox=as.data.frame(do.call("rbind", proj_wilcox))
+rownames(proj_wilcox)=NULL
+proj_wilcox=proj_wilcox[,-c(6,8)]
+colnames(proj_wilcox)[1]="PC"
+
+# make plots for profiles and projections
+df_pos_pc=as.data.frame(pca_anodev$x[,1:6])
+df_pos_pc$nuclei=group_nuclei
+df_pos_pc$profiles=factor(grp_hclust)
+df_pos_pc$projection=factor(grp_proj)
+
+df_pos_pc_all=reshape2::melt(df_pos_pc)
+df_pos_pc_nostr=droplevels(df_pos_pc_all[df_pos_pc_all$projection!="Striatum",])
+
+#plot for profiles
+ggboxplot(data = df_pos_pc_all, x="profiles", y="value", fill = rep(c("#6391BA", "#CE4A45", "#ECB64C", "#A6761D", "gray50"),6), add = "jitter", legend = "none", facet.by = "variable") + rotate_x_text(angle = 45) + stat_compare_means(label = "p.signif", method = "wilcox.test",ref.group = ".all.")
+
+#plot for projections
+ggboxplot(data = df_pos_pc_nostr, x="projection", y="value", fill = "projection", add = "jitter", legend = "none", facet.by = "variable") + rotate_x_text(angle = 45) + stat_compare_means(label = "p.signif", method = "wilcox.test",ref.group = ".all.")
+
+```
+
+
+Relationship of PCs with anatomy
+
+```{r,anat}
+
+## read in Allen CCF coord for nuclei centers and nuclei metadata
+#nuclei_data # VAL split into VL and VA (using the same coordinates)
+#aba_centers # centoid of each nucleus
+
+nuclei_centers=aba_centers[match(nuclei_data$id,aba_centers$structure_id),]
+nuclei_centers$nucleus=nuclei_data$acronym
+
+samples_centers_nuclein=nuclei_centers[match(group_nuclei,nuclei_centers$nucleus),]
+
+pos_pc=list()
+for(i in 1:10){
+  pos_pc[[i]]=tapply(pca_anodev$x[,i], group_nuclei, mean)
+}
+
+lmPlot_wtext=function(x, y, labels, xlab,ylab, main="", col="black", xaxt=NULL, yaxt=NULL, cex=1){
+  plot(y~x,xlab=xlab,ylab=ylab, pch="", xaxt=xaxt, yaxt=yaxt)
+  text(x,y,labels=labels, col=col, cex=cex)
+  lm=lm(y~x)
+  s.lm=summary(lm)
+  abline(lm, lty=2 ,col="black")
+  rsq=format(s.lm$r.squared, digits = 2)
+  pval=format(s.lm$coefficients[2,4], digits = 3)
+  if(cor(x,y)>0){
+    text(min(x),max(y)-.5, labels = bquote(R^2==.(rsq)), pos = 4, cex=cex)
+    text(min(x),max(y)-5, labels = bquote(p==.(pval)), pos = 4, cex=cex)
+  } else{
+    text(max(x),max(y)-.5, labels = bquote(R^2==.(rsq)), pos = 2, cex=cex)
+    text(max(x),max(y)-5, labels = bquote(p==.(pval)), pos = 2, cex=cex)
+  }
+  title(main=main)
+}
+
+
+names_pc=names(pos_pc[[1]])
+
+pdf("~/pc1-6_anatomy_link.pdf",w=7.75,h=15, useDingbats = F)
+mypar()
+par(mfrow=c(6,3))
+lmPlot_wtext(y = pos_pc[[1]], x = centers_centered$x, labels = names_pc, xlab="" ,ylab = "PC1 position", main = "rostrocaudal position", col=col_hclust1, xaxt = "n")
+lmPlot_wtext(y = pos_pc[[1]], x = centers_centered$y, labels = names_pc, xlab="", ylab = "", main = "dorsoventral position", col=col_hclust1, xaxt = "n", yaxt = "n")
+lmPlot_wtext(y = pos_pc[[1]], x = centers_centered$z, labels = names_pc, xlab="", ylab = "", main = "mediolateral position", col=col_hclust1, xaxt = "n", yaxt = "n")
+
+lmPlot_wtext(y = pos_pc[[2]], x = centers_centered$x, labels = names_pc, xlab="" ,ylab = "PC2 position", col=col_hclust1, xaxt = "n")
+lmPlot_wtext(y = pos_pc[[2]], x = centers_centered$y, labels = names_pc, xlab="", ylab = "", col=col_hclust1, xaxt = "n", yaxt = "n")
+lmPlot_wtext(y = pos_pc[[2]], x = centers_centered$z, labels = names_pc, xlab="", ylab = "", col=col_hclust1, xaxt = "n", yaxt = "n")
+
+lmPlot_wtext(y = pos_pc[[3]], x = centers_centered$x, labels = names_pc, xlab="" ,ylab = "PC3 position", col=col_hclust1, xaxt = "n")
+lmPlot_wtext(y = pos_pc[[3]], x = centers_centered$y, labels = names_pc, xlab="", ylab = "", col=col_hclust1, xaxt = "n", yaxt = "n")
+lmPlot_wtext(y = pos_pc[[3]], x = centers_centered$z, labels = names_pc, xlab="", ylab = "", col=col_hclust1, xaxt = "n", yaxt = "n")
+
+lmPlot_wtext(y = pos_pc[[4]], x = centers_centered$x, labels = names_pc, xlab="" ,ylab = "PC4 position", col=col_hclust1, xaxt = "n")
+lmPlot_wtext(y = pos_pc[[4]], x = centers_centered$y, labels = names_pc, xlab="", ylab = "", col=col_hclust1, xaxt = "n", yaxt = "n")
+lmPlot_wtext(y = pos_pc[[4]], x = centers_centered$z, labels = names_pc, xlab="", ylab = "", col=col_hclust1, xaxt = "n", yaxt = "n")
+
+lmPlot_wtext(y = pos_pc[[5]], x = centers_centered$x, labels = names_pc, xlab="" ,ylab = "PC5 position", col=col_hclust1, xaxt = "n")
+lmPlot_wtext(y = pos_pc[[5]], x = centers_centered$y, labels = names_pc, xlab="", ylab = "", col=col_hclust1, xaxt = "n", yaxt = "n")
+lmPlot_wtext(y = pos_pc[[5]], x = centers_centered$z, labels = names_pc, xlab="", ylab = "", col=col_hclust1, xaxt = "n", yaxt = "n")
+
+lmPlot_wtext(y = pos_pc[[6]], x = centers_centered$x, labels = names_pc, xlab="x" ,ylab = "PC6 position", col=col_hclust1)
+lmPlot_wtext(y = pos_pc[[6]], x = centers_centered$y, labels = names_pc, xlab="y", ylab = "", col=col_hclust1, yaxt = "n")
+lmPlot_wtext(y = pos_pc[[6]], x = centers_centered$z, labels = names_pc, xlab="z", ylab = "", col=col_hclust1, yaxt = "n")
+
+
+# PC1 vs mediolateral (in mm)
+centers_centered=nuclei_centers[match(names(pos_pc1_mean),nuclei_centers$nucleus),2:4]
+lmPlot_wtext(y = pos_pc1_mean, x = (centers_centered$z-5695)/1000, labels = names(pos_pc1_mean), ylab = "PC1 position", xlab = "mediolateral position (mm)",col=col_hclust1, cex = 1)
+
+```
+
+
+Number of differentially expressed genes
+
+```{r, dge_profiles, eval=FALSE}
+
+get_edger_pval=function(counts, idx, grp){
+  require(edgeR)
+  d=calcNormFactors(DGEList(counts[,idx], genes = d_tseq_nuclei$genes, group=grp[idx]))
+  design=model.matrix(~grp[idx])
+  d=estimateDisp(d, design = design)
+  fit=glmFit(d, design = design)
+  glmLRT(fit, coef = 2)
+}
+
+pval.foho=data.frame(row.names = rownames(d_tseq_nuclei$counts))
+pval.ilfo=data.frame(row.names = rownames(d_tseq_nuclei$counts))
+pval.ilho=data.frame(row.names = rownames(d_tseq_nuclei$counts))
+lfc.foho=data.frame(row.names = rownames(d_tseq_nuclei$counts))
+lfc.ilfo=data.frame(row.names = rownames(d_tseq_nuclei$counts))
+lfc.ilho=data.frame(row.names = rownames(d_tseq_nuclei$counts))
+for(j in 1:100){
+  print(paste("Starting iteration", j))
+  idx_foho=c(sample(grep('Primary',grp_hclust),28, replace=T),sample(grep('Secondary',grp_hclust),28, replace=T))
+  idx_ilfo=c(sample(grep('Primary',grp_hclust),28, replace=T),sample(grep('Tertiary',grp_hclust),28, replace=T))
+  idx_ilho=c(sample(grep('Secondary',grp_hclust),28, replace=T),sample(grep('Tertiary',grp_hclust),28, replace=T))
+  lrt_foho=get_edger_pval(counts=d_tseq_nuclei$counts, idx = idx_foho, grp = grp_hclust)
+  pval.foho[,j]=p.adjust(lrt_foho$table$PValue, method = "BH")
+  lfc.foho[,j]=lrt_foho$table$logFC
+  lrt_ilho=get_edger_pval(counts=d_tseq_nuclei$counts, idx = idx_ilho, grp = grp_hclust)
+  pval.ilho[,j]=p.adjust(lrt_ilho$table$PValue, method = "BH")
+  lfc.ilho[,j]=lrt_ilho$table$logFC
+  lrt_ilfo=get_edger_pval(counts=d_tseq_nuclei$counts, idx = idx_ilfo, grp = grp_hclust)
+  pval.ilfo[,j]=p.adjust(lrt_ilfo$table$PValue, method = "BH")
+  lfc.ilfo[,j]=lrt_ilfo$table$logFC
+}
+
+#summarize
+de_foho=rowMeans(pval.foho)<.05
+de_ilho=rowMeans(pval.ilho)<.05
+de_ilfo=rowMeans(pval.ilfo)<.05
+
+get_avg_LFC=function(lfc.table, which.genes){
+  a1=abs(rowMeans(lfc.table)[which.genes])
+  a1[order(a1,decreasing = T)]
+}
+
+lfc.avg_foho=get_avg_LFC(lfc.table = lfc.foho, which.genes = de_foho)
+lfc.avg_ilfo=get_avg_LFC(lfc.table = lfc.ilfo, which.genes = de_ilfo)
+lfc.avg_ilho=get_avg_LFC(lfc.table = lfc.ilho, which.genes = de_ilho)
+
+get_sd_LFC=function(lfc.table, which.genes){
+  a1=abs(rowMeans(lfc.table)[which.genes])
+  ord=order(a1,decreasing = T)
+  b1=apply(lfc.table,1,function(x){sd(x)})[which.genes]
+  b1=b1[ord]
+}
+lfc.sd_foho=get_sd_LFC(lfc.table = lfc.foho, which.genes = de_foho)
+lfc.sd_ilfo=get_sd_LFC(lfc.table = lfc.ilfo, which.genes = de_ilfo)
+lfc.sd_ilho=get_sd_LFC(lfc.table = lfc.ilho, which.genes = de_ilho)
+
+lfc_list=rbind("Primary vs. Tertiary"=data.frame(logFC=lfc.avg_ilfo,sd=lfc.sd_ilfo,rank=1:length(lfc.avg_ilfo),row.names=NULL),
+              "Secondary vs. Tertiary"=data.frame(logFC=lfc.avg_ilho,sd=lfc.sd_ilho,rank=1:length(lfc.avg_ilho),row.names=NULL),
+              "Primary vs. Secondary"=data.frame(logFC=lfc.avg_foho,sd=lfc.sd_foho,rank=1:length(lfc.avg_foho),row.names=NULL))
+lfc_df=data.frame(lfc_list,comparison=gsub("\\.\\d*$|\\.\\ENS.*$","",rownames(lfc_list)),row.names=NULL)
+lfc_df$comparison=factor(lfc_df$comparison, levels = c('Primary vs. Tertiary','Secondary vs. Tertiary','Primary vs. Secondary'))
+
+#plot with SD of bootstrapped value
+ggplot(lfc_df, aes(y=logFC, x=rank, group=comparison)) + geom_line(aes(color=comparison), size=1) +
+  geom_ribbon(aes(ymin=logFC-sd, ymax=logFC+sd, x=rank, fill=comparison), alpha = 0.3) + scale_color_manual(values=c(1:5)) + scale_fill_manual(values=c(1:5)) +
+  labs(y = "Absolute Log2 Fold Change", x = "Number of\nDifferentially Expressed Genes", fill="") + theme_classic() + theme(legend.position = c(.7, .9), legend.title=element_blank()) + scale_y_continuous(limits = c(0, 13)) + coord_flip() + guides(fill=FALSE)
+
+```
+
+logistic regression (elastic-net) classifier
+
+```{r, logistic, eval=FALSE}
+
+library(caret)
+
+#5-fold cross-validation
+ctrl=trainControl(method = 'cv', number = 5, savePred=T, classProb=T)
+
+group_3class=group_nuclei
+group_3class=sub('LP|PO','Matrix',group_3class)
+group_3class=sub('LGd|VB','Core',group_3class)
+group_3class=sub('CL|CM|IMD|PCN|PF|PVT|RE|SPA','ILM',group_3class)
+group_modality=group_nuclei
+group_modality=sub('LP|LGd','Vis',group_modality)
+group_modality=sub('VB|PO','Som',group_modality)
+group_modality2=sub('VA|VM|VL','Mot',group_modality)
+group_modality2=sub('Som|Vis','Sens',group_modality2)
+#smallest group is 11 samples
+
+glmnet.foho.res=data.frame(row.names = 1:100)
+glmnet.ilfo.res=data.frame(row.names = 1:100)
+glmnet.ilho.res=data.frame(row.names = 1:100)
+glmnet.mod1.res=data.frame(row.names = 1:100)
+glmnet.mod2.res=data.frame(row.names = 1:100)
+
+for(j in 1:100){
+  print(paste("Starting iteration", j))
+  #for(i in c(10,20,50,100,200,500,1000)){ #previously compared how many genes is best to see differences in accuracy
+  for(i in 20){
+    idx_foho=c(sample(grep('Primary',grp_hclust),11),sample(grep('Secondary',grp_hclust),11))
+    idx_ilfo=c(sample(grep('Primary',grp_hclust),11),sample(grep('Tertiary',grp_hclust),11))
+    idx_ilho=c(sample(grep('Secondary',grp_hclust),11),sample(grep('Tertiary',grp_hclust),11))
+    idx_mod1=c(sample(grep('Vis',group_modality),11),sample(grep('Som',group_modality),11))
+    idx_mod2=c(sample(grep('Sens',group_modality2),11),sample(grep('Mot',group_modality2),11))
+    genes=sample(rownames(vst_nuclei),i)
+    i=paste("features",i,sep='')
+    glmnet.foho=train(classes~., data=data.frame(t(vst_nuclei[genes,idx_foho]),classes=grp_hclust[idx_foho]), method = "glmnet", trControl = ctrl)
+    glmnet.ilfo=train(classes~., data=data.frame(t(vst_nuclei[genes,idx_ilfo]),classes=grp_hclust[idx_ilfo]), method = "glmnet", trControl = ctrl)
+    glmnet.ilho=train(classes~., data=data.frame(t(vst_nuclei[genes,idx_ilho]),classes=grp_hclust[idx_ilho]), method = "glmnet", trControl = ctrl)
+    glmnet.mod1=train(classes~., data=data.frame(t(vst_nuclei[genes,idx_mod1]), classes=group_modality[idx_mod1]), method = "glmnet", trControl = ctrl)
+    glmnet.mod2=train(classes~., data=data.frame(t(vst_nuclei[genes,idx_mod2]), classes=group_modality2[idx_mod2]), method = "glmnet", trControl = ctrl)
+    glmnet.foho.res[j,i] = max(glmnet.foho$results$Accuracy)
+    glmnet.ilfo.res[j,i] = max(glmnet.ilfo$results$Accuracy)
+    glmnet.ilho.res[j,i] = max(glmnet.ilho$results$Accuracy)
+    glmnet.mod1.res[j,i] = max(glmnet.mod1$results$Accuracy)
+    glmnet.mod2.res[j,i] = max(glmnet.mod2$results$Accuracy)
+  }
+}
+
+#summarize results
+foho=data.frame(reshape2::melt(glmnet.foho.res),contrast='Primary vs. Secondary')
+ilfo=data.frame(reshape2::melt(glmnet.ilfo.res),contrast='Primary vs. Tertiary')
+ilho=data.frame(reshape2::melt(glmnet.ilho.res),contrast='Secondary vs. Tertiary')
+vissom=data.frame(reshape2::melt(glmnet.mod1.res),contrast='Visual vs. Somatosensory')
+sensmot=data.frame(reshape2::melt(glmnet.mod2.res),contrast='Sensory vs. Motor')
+
+logistic_test=as.data.frame(rbind(foho,ilfo,ilho,vissom,sensmot))
+names(logistic_test)=c('features','accuracy','class')
+logistic_test$class=factor(logistic_test$class, levels = rev(c('Primary vs. Tertiary','Secondary vs. Tertiary','Primary vs. Secondary','Sensory vs. Motor','Visual vs. Somatosensory')))
+
+#plot accuracy boxplots
+ggplot(aes(x=class,y=accuracy,fill=class), data=logistic_test) + scale_fill_manual(values=c(5:1)) + labs(x = "", y = "Classification Accuracy", fill="") + geom_boxplot(outlier.shape = NA, outlier.size = 0) + theme_classic() + theme(legend.position="none") + coord_flip()
+
+```
+
+Motor vs. sensory marker genes
+
+```{r, mot_sens}
+get_snr=function(counts=counts, idx1=idx1, idx2=idx2, name1='a', name2='b', genes=d_tseq_nuclei$genes){
+  require(limma)
+  y=DGEList(counts = counts[,c(idx1,idx2)], group = c(rep(name1,length(idx1)),rep(name2,length(idx2))))
+  y=calcNormFactors(y)
+  design <- model.matrix(~0+relevel(y$samples$group,name1))
+  v <- voom(y, design, plot=TRUE)
+  nidx1=1:length(idx1)
+  nidx2=length(idx1)+1:length(idx2)
+  v=v[,c(nidx1,nidx2)]
+  calc_SNR_bygene=function(genevector){
+    SR=as.matrix(dist(genevector))
+    SR1=mean(c(SR[nidx1,nidx2],SR[nidx2,nidx1]))
+    SR0=mean(c(SR[nidx1,nidx1],SR[nidx2,nidx2]))
+    SR1 / SR0
+  }
+  apply(v,1,calc_SNR_bygene)
+}
+
+#SNR for profiles
+snr_Primary=get_snr(counts = d_tseq_nuclei$counts, idx1 = which(grp_hclust=="Primary"), idx2 = which(grp_hclust!="Primary"), name1 = "Primary", name2 = "other")
+snr_Secondary=get_snr(counts = d_tseq_nuclei$counts, idx1 = which(grp_hclust=="Secondary"), idx2 = which(grp_hclust!="Secondary"), name1 = "Secondary", name2 = "other")
+snr_Tertiary=get_snr(counts = d_tseq_nuclei$counts, idx1 = which(grp_hclust=="Tertiary"), idx2 = which(grp_hclust!="Tertiary"), name1 = "Tertiary", name2 = "other")
+snr_AD=get_snr(counts = d_tseq_nuclei$counts, idx1 = which(grp_hclust=="AD"), idx2 = which(grp_hclust!="AD"), name1 = "AD", name2 = "other")
+snr_RE=get_snr(counts = d_tseq_nuclei$counts, idx1 = which(grp_hclust=="RE"), idx2 = which(grp_hclust!="RE"), name1 = "RE", name2 = "other")
+
+#SNR for motor vs. sensory thalamus
+snr_MotSens=get_snr(counts = d_tseq_nuclei$counts, idx1 = which(group_modality2=="Mot"), idx2 = which(group_modality2=="Sens"), name1 = "Mot", name2 = "Sens")
+
+
+#DGE for motor vs sensory
+lrt_sens.mot=glmLRT(fit_tseq_nuclei,contrast=makeContrasts((VPL+PO+LGd+LP)*1/4-(VL+VA+VM)*1/3,levels=design))
+keep.tpm_motor_5=rowSums(tpm_mean[,c("VA","VM","VL")]>5)==3
+keep.tpm_sens_5=rowSums(tpm_mean[,c("LGd","VB","LP","PO")]>5)==4
+
+genes_Mot=data.frame(genes=lrt_sens.mot$genes$gene_symbol, lrt_sens.mot$table, fdr=p.adjust(lrt_sens.mot$table$PValue,method = "BH"), snr=snr_MotSens, keep_tpm_5=keep.tpm_motor_5)
+genes_Mot= genes_Mot  %>% filter(logFC<(-1), fdr<10^-3, keep_tpm_5==TRUE) %>% arrange(desc(snr))
+motor_genes=head(genes_Mot$genes,21)[-1] #remove Xist (likely flase-positive due to uneven sex across nuclei)
+
+genes_Sens=data.frame(genes=lrt_sens.mot$genes$gene_symbol, lrt_sens.mot$table, fdr=p.adjust(lrt_sens.mot$table$PValue,method = "BH"), snr=snr_MotSens, keep_tpm_5=keep.tpm_sens_5)
+genes_Sens= genes_Mot  %>% filter(logFC>2, fdr<10^-3, keep_tpm_5==TRUE) %>% arrange(desc(snr))
+sens_genes=head(genes_Sens$genes,20)
+
+#heatmaps for sensory and motor enriched genes
+Heatmap(t(scale(t(vst_mean[as.character(sens_genes),region.ord5]))),col=colorRamp2(seq(-2.5,2.5, length = 10), rev(brewer.pal(10, "RdBu"))), heatmap_legend_param = list(color_bar="continuous", title="Z-score"), show_heatmap_legend = F, column_title = "Sensory Enriched Genes", cluster_columns = F, cluster_rows = F)
+
+Heatmap(t(scale(t(vst_mean[as.character(motor_genes),region.ord5]))),col=colorRamp2(seq(-2.5,2.5, length = 10), rev(brewer.pal(10, "RdBu"))), heatmap_legend_param = list(color_bar="continuous", title="Z-score"), show_heatmap_legend = F, column_title = "Motor Enriched Genes", cluster_columns = F, cluster_rows = F)
+
+```
+
+
+
+## Human microarray analysis
+
+processing human microarray data
+
+```{r, hu_ma, eval=FALSE}
+
+## read in microarray data from Allen
+
+get_thal_expression=function(dir, thal_ids=thal_id_ontol){
+  print("reading in expression")
+  expression=read.csv(paste(dir,"MicroarrayExpression.csv", sep = "/"), header = F, row.names = 1)
+  print("reading in the rest")
+  qc=read.csv(paste(dir,"PACall.csv", sep = "/"), header = F, row.names = 1)
+  samples=read.csv(paste(dir,"SampleAnnot.csv", sep = "/"))
+  thal_id_present=thal_ids[thal_ids %in% samples$structure_id]
+  idx_thal=match(thal_id_present, samples$structure_id)
+  list(expression=expression[,idx_thal],qc=qc[,idx_thal],samples=samples[idx_thal,])
+}
+
+#nma10021=get_thal_expression("C:/Users/schulmanna/Desktop/allen_microarray/normalized_microarray_donor10021")
+#nma12876=get_thal_expression("C:/Users/schulmanna/Desktop/allen_microarray/normalized_microarray_donor12876")
+#nma14380=get_thal_expression("C:/Users/schulmanna/Desktop/allen_microarray/normalized_microarray_donor14380")
+#nma15496=get_thal_expression("C:/Users/schulmanna/Desktop/allen_microarray/normalized_microarray_donor15496")
+#nma15697=get_thal_expression("C:/Users/schulmanna/Desktop/allen_microarray/normalized_microarray_donor15697")
+#nma9861=get_thal_expression("C:/Users/schulmanna/Desktop/allen_microarray/normalized_microarray_donor9861")
+
+#averag probes for same gene
+#average both hemispheres
+collapse_sides_probes=function(obj, probenames=probes$gene_id){
+  obj$expression=apply(obj$expression,2,function(x){tapply(x, probes$gene_id, mean)})
+  obj$expression=t(apply(obj$expression,1,function(x){tapply(x, droplevels(obj$samples$structure_acronym), mean)}))
+  obj$qc=apply(obj$qc,2,function(x){tapply(x, probes$gene_id, mean)})
+  obj$qc=t(apply(obj$qc,1,function(x){tapply(x, droplevels(obj$samples$structure_acronym), mean)}))
+  obj$samples=colnames(obj$expression)
+  return(obj)
+}
+
+collapse_sides_probes=function(obj, probenames=probes$gene_id){
+  obj$expression=apply(obj$expression,2,function(x){tapply(x, probes$gene_id, mean)})
+  obj$expression=t(apply(obj$expression,1,function(x){tapply(x, droplevels(obj$samples$structure_acronym), mean)}))
+  obj$qc=apply(obj$qc,2,function(x){tapply(x, probes$gene_id, mean)})
+  obj$qc=t(apply(obj$qc,1,function(x){tapply(x, droplevels(obj$samples$structure_acronym), mean)}))
+  obj$samples=data.frame(table(droplevels(obj$samples$structure_acronym)))
+  obj$samples$mni_x=tapply(obj$samples$mni_x, droplevels(obj$samples$structure_acronym), function(x){mean(abs(x))})
+  obj$samples$mni_y=tapply(obj$samples$mni_y, droplevels(obj$samples$structure_acronym), mean)
+  obj$samples$mni_z=tapply(obj$samples$mni_z, droplevels(obj$samples$structure_acronym), mean)
+  return(obj)
+}
+
+nma10021.coll=collapse_sides_probes(nma10021)
+nma12876.coll=collapse_sides_probes(nma12876)
+nma14380.coll=collapse_sides_probes(nma14380)
+nma15496.coll=collapse_sides_probes(nma15496)
+nma15697.coll=collapse_sides_probes(nma15697)
+nma9861.coll=collapse_sides_probes(nma9861)
+genes.coll=probes$gene_symbol[match(rownames(nma10021.coll$expression),probes$gene_id)]
+
+combined_nma.coll=list(expression=cbind(nma10021.coll[[1]], nma12876.coll[[1]], nma14380.coll[[1]], nma15496.coll[[1]], nma15697.coll[[1]], nma9861.coll[[1]]), qc=cbind(nma10021.coll[[2]], nma12876.coll[[2]], nma14380.coll[[2]], nma15496.coll[[2]], nma15697.coll[[2]], nma9861.coll[[2]]), samples=rbind(nma10021.coll[[3]], nma12876.coll[[3]], nma14380.coll[[3]], nma15496.coll[[3]], nma15697.coll[[3]], nma9861.coll[[3]]))
+
+names_combined=c(paste("nma10021",colnames(nma10021.coll[[1]]), sep = "_"),
+  paste("nma12876",colnames(nma12876.coll[[1]]), sep = "_"),
+  paste("nma14380",colnames(nma14380.coll[[1]]), sep = "_"),
+  paste("nma15496",colnames(nma15496.coll[[1]]), sep = "_"),
+  paste("nma15697",colnames(nma15697.coll[[1]]), sep = "_"),
+  paste("nma9861",colnames(nma9861.coll[[1]]), sep = "_"))
+
+colnames(combined_nma.coll$expression)=colnames(combined_nma.coll$qc)=rownames(combined_nma.coll$samples)=names_combined
+
+```
+
+Matching homologous genes and projection onto mouse PC1
+
+```{r, hu_ma_pc1proj, eval=FALSE}
+
+## read in mouse to human homology annotation from bioMart
+mouse2human=read.csv("C:/Users/schulmanna/Desktop/allen_microarray/mouse2human_ens88.csv")
+mouse2human=mouse2human[!is.na(mouse2human$Human.orthology.confidence..0.low..1.high.),]
+mouse2human_highconf=mouse2human[mouse2human$Human.orthology.confidence..0.low..1.high.==1,]
+
+anodev2human=mouse2human[mouse2human$Gene.stable.ID %in% anodev_top500,]
+anodev2human.hc=mouse2human_highconf[mouse2human_highconf$Gene.stable.ID %in% anodev_top500,]
+
+idx_anodev_coll=genes.coll %in% anodev2human$Human.gene.name
+idx_anodev_coll.hc=genes.coll %in% anodev2human.hc$Human.gene.name
+genes_anodev_coll=genes.coll[idx_anodev_coll]
+genes_anodev_coll.hc=genes.coll[idx_anodev_coll.hc]
+
+#remove duplicate gene (ELMOD1 has two homologs)
+genes_anodev_coll[duplicated(genes_anodev_coll)]
+idx_anodev_coll=idx_anodev_coll & !grepl("ELMOD1",genes.coll)
+genes_anodev_coll=genes_anodev_coll[-grep("ELMOD1",genes_anodev_coll)]
+idx_anodev_coll.hc=idx_anodev_coll.hc & !grepl("ELMOD1",genes.coll)
+genes_anodev_coll.hc=genes_anodev_coll.hc[-grep("ELMOD1",genes_anodev_coll.hc)]
+
+combined_nma.coll.anodev=list(expression=data.frame(combined_nma.coll$expression[idx_anodev_coll,], row.names = genes_anodev_coll), qc=data.frame(combined_nma.coll$qc[idx_anodev_coll,], row.names = genes_anodev_coll), samples=combined_nma.coll$samples)
+combined_nma.coll.anodev.hc=list(expression=data.frame(combined_nma.coll$expression[idx_anodev_coll.hc,], row.names = genes_anodev_coll.hc), qc=data.frame(combined_nma.coll$qc[idx_anodev_coll.hc,], row.names = genes_anodev_coll.hc), samples=combined_nma.coll$samples)
+
+rownames(pca_anodev$rotation)=sub("\\..*$","",rownames(pca_anodev$rotation))
+names(pca_anodev$center)=sub("\\..*$","",names(pca_anodev$center))
+
+mouse_genes_anodev=anodev2human$Gene.stable.ID[match(genes_anodev_coll, anodev2human$Human.gene.name)]
+mouse_genes_anodev.hc=anodev2human.hc$Gene.stable.ID[match(genes_anodev_coll.hc, anodev2human.hc$Human.gene.name)]
+
+#quntile normalize
+vst_grandmean=apply(vst_anodev500, 1, mean)
+combined_nma.coll.anodev.qn=data.frame(preprocessCore::normalize.quantiles.use.target(as.matrix(combined_nma.coll.anodev$expression),target = vst_grandmean))
+rownames(combined_nma.coll.anodev.qn)=rownames(combined_nma.coll.anodev$expression)
+colnames(combined_nma.coll.anodev.qn)=colnames(combined_nma.coll.anodev$expression)
+
+combined_nma.coll.anodev.hc.qn=data.frame(preprocessCore::normalize.quantiles.use.target(as.matrix(combined_nma.coll.anodev.hc$expression),target = vst_grandmean))
+rownames(combined_nma.coll.anodev.hc.qn)=rownames(combined_nma.coll.anodev.hc$expression)
+colnames(combined_nma.coll.anodev.hc.qn)=colnames(combined_nma.coll.anodev.hc$expression)
+
+human_samples=data.frame(region=sub(".*_","",colnames(combined_nma.coll.anodev.hc.qn)),indiv=sub("_.*","",colnames(combined_nma.coll.anodev.hc.qn)))
+combined_nma.coll.anodev.qn_mean=data.frame(t(apply(combined_nma.coll.anodev.qn,1,function(x){tapply(x, combined_nma.coll.anodev$samples, mean)})))
+combined_nma.coll.anodev.hc.qn_mean=data.frame(t(apply(combined_nma.coll.anodev.hc.qn,1,function(x){tapply(x, combined_nma.coll.anodev$samples, mean)})))
+
+#project onto PC1
+proj.pc1.human.mouse=scale(x = t(combined_nma.coll.anodev.qn), center = T, scale = pca_anodev$scale) %*% pca_anodev$rotation[as.character(mouse_genes_anodev),1]
+
+proj.pc1.human.mouse.hc=scale(x = t(combined_nma.coll.anodev.hc.qn), center = T, pca_anodev$scale) %*% pca_anodev$rotation[as.character(mouse_genes_anodev.hc),1]
+
+human.ord.pc1=levels(human_samples$region)[order(tapply(proj.pc1.human.mouse, human_samples$region, mean))]
+region.ord.pc1=levels(factor(group_nuclei))[order(tapply(pca_anodev$x[,1], group_nuclei, mean))]
+
+rownames(vst_anodev500_mean)=sub("\\..*$","",rownames(vst_anodev500_mean))
+vst_anodev_mean.homolog=vst_anodev500_mean[as.character(mouse_genes_anodev),]
+vst_anodev_mean.homolog.hc=vst_anodev500_mean[as.character(mouse_genes_anodev.hc),]
+
+pc1_loadings_filt=pca_anodev$rotation[as.character(mouse_genes_anodev),1]
+pc1_loadings_ord=names(pc1_loadings_filt)[order(pc1_loadings_filt)]
+pc1_loadings_filt.hc=pca_anodev$rotation[as.character(mouse_genes_anodev.hc),1]
+pc1_loadings_ord.hc=names(pc1_loadings_filt.hc)[order(pc1_loadings_filt.hc)]
+
+# view expression of the genes in a heatmap
+h_mouse=Heatmap(t(scale(t(vst_anodev500_mean[as.character(pc1_loadings_ord),region.ord.pc1]))),col=circlize::colorRamp2(seq(-3,3, length = 10), rev(RColorBrewer::brewer.pal(10, "RdBu"))), heatmap_legend_param = list(color_bar="continuous", title="Z-score"), show_row_names = F, cluster_columns = F, column_title = "differentially expressed\nmouse genes", show_heatmap_legend = F, cluster_rows = F)
+
+h_human=Heatmap(t(scale(t(combined_nma.coll.anodev.qn_mean[,human.ord.pc1]))),col=circlize::colorRamp2(seq(-3,3, length = 10), rev(RColorBrewer::brewer.pal(10, "RdBu"))), heatmap_legend_param = list(color_bar="continuous", title="Z-score"), show_row_names = F, cluster_columns = F, column_title = "homologous\nhuman genes")
+
+#heatmap of matched genes
+h_mouse+h_human
+h_mouse
+h_human
+
+# summarize projection onto PC1
+df_proj.pc1.human=data.frame(mouse_PC1_proj=proj.pc1.human.mouse, mouse_PC1_proj_hc=proj.pc1.human.mouse.hc, region=combined_nma.coll.anodev$samples$Var1, hemispheres=factor(combined_nma.coll.anodev$samples$Freq), individual=factor(gsub("nma|_.*","",rownames(combined_nma.coll.anodev$samples))))
+df_proj.pc1.human$region=factor(df_proj.pc1.human$region, levels = human.ord.pc1)
+
+# plot boxplot with individuals as dots
+ggplot(df_proj.pc1.human, aes(x=region, y=mouse_PC1_proj)) + geom_boxplot(fill="#7FC97F", outlier.shape = NA) + geom_jitter(position = position_jitter(.1)) + scale_y_continuous(breaks = c(-5,0,5)) + theme_classic() + theme(axis.text.x = element_text(size=12, angle = 90, hjust = 1, vjust = .5)) + xlab("") + ylab("mouse PC1 mapping")
+
+#add stats
+
+#parametric
+summary(aov(data = df_proj.pc1.human, mouse_PC1_proj~0+region))
+
+#normal or not (not significantly different from normal but borderline: p=0.0635)
+shapiro.test(df_proj.pc1.human$mouse_PC1_proj)
+
+#Kruskal-Wallis instead of ANOVA
+kruskal.test(data = df_proj.pc1.human, mouse_PC1_proj~0+region)
+
+#wilcoxon test for indiv groups (one-sample)
+wilcox_pval=vector()
+
+wilcox_pval["LGd"]=wilcox.test(x = df_proj.pc1.human$mouse_PC1_proj[df_proj.pc1.human$region=="LGd"], mu = mean(df_proj.pc1.human$mouse_PC1_proj), alternative = "greater")$p.value
+wilcox_pval["ILr"]=wilcox.test(x = df_proj.pc1.human$mouse_PC1_proj[df_proj.pc1.human$region=="ILr"], mu = mean(df_proj.pc1.human$mouse_PC1_proj), alternative = "less")$p.value
+wilcox_pval["ILc"]=wilcox.test(x = df_proj.pc1.human$mouse_PC1_proj[df_proj.pc1.human$region=="ILc"], mu = mean(df_proj.pc1.human$mouse_PC1_proj), alternative = "less")$p.value
+
+p.adjust(wilcox_pval, method="BH")
+
+```
+
+Human projected PC1 relationship to anatomy (MNI coord)
+
+```{r, mni}
+
+collapse_mni=function(obj, probenames=probes$gene_id){
+  x=tapply(obj$samples$mni_x, droplevels(obj$samples$structure_acronym), function(x){mean(abs(x))})
+  y=tapply(obj$samples$mni_y, droplevels(obj$samples$structure_acronym), mean)
+  z=tapply(obj$samples$mni_z, droplevels(obj$samples$structure_acronym), mean)
+  return(data.frame(mni_x=x,mni_y=y,mni_z=z))
+}
+nma10021.mni=collapse_mni(nma10021)
+nma12876.mni=collapse_mni(nma12876)
+nma14380.mni=collapse_mni(nma14380)
+nma15496.mni=collapse_mni(nma15496)
+nma15697.mni=collapse_mni(nma15697)
+nma9861.mni=collapse_mni(nma9861)
+
+mni_combined=rbind(nma10021.mni, nma12876.mni, nma14380.mni, nma15496.mni, nma15697.mni, nma9861.mni)
+rownames(mni_combined)=names_combined
+mni_combined$PC1_proj=proj.pc1.human.mouse
+mni_combined$region=sub(".*_","",rownames(mni_combined))
+
+mni_median=data.frame(mni_x=tapply(mni_combined$mni_x,mni_combined$region, median),
+                      mni_y=tapply(mni_combined$mni_y,mni_combined$region, median),
+                      mni_z=tapply(mni_combined$mni_z,mni_combined$region, median),
+                      PC1proj=tapply(mni_combined$PC1_proj,mni_combined$region, median))
+
+
+lmPlot_wtext=function(x, y, labels, xlab,ylab, main="", col="black", xaxt=NULL, yaxt=NULL, cex=1){
+  plot(y~x,xlab=xlab,ylab=ylab, pch="", xaxt=xaxt, yaxt=yaxt)
+  text(x,y,labels=labels, col=col, cex=cex)
+  lm=lm(y~x)
+  s.lm=summary(lm)
+  abline(lm, lty=2 ,col="black")
+  rsq=format(s.lm$r.squared, digits = 2)
+  pval=format(s.lm$coefficients[2,4], digits = 3)
+  if(cor(x,y)>0){
+    text(min(x),max(y)-.5, labels = bquote(R^2==.(rsq)), pos = 4, cex=cex)
+    text(min(x),max(y)-1.5, labels = bquote(p==.(pval)), pos = 4, cex=cex)
+  } else{
+    text(max(x),max(y)-.5, labels = bquote(R^2==.(rsq)), pos = 2, cex=cex)
+    text(max(x),max(y)-1.5, labels = bquote(p==.(pval)), pos = 2, cex=cex)
+  }
+  title(main=main)
+}
+
+lmPlot_wtext(x = mni_combined$mni_x, y=mni_combined$PC1_proj, xlab="x",ylab="PC1", labels = mni_combined$region, main="Mediolateral")
+lmPlot_wtext(x = mni_combined$mni_y, y=mni_combined$PC1_proj, xlab="y",ylab="PC1", labels = mni_combined$region, main="Rostrocaudal")
+lmPlot_wtext(x = mni_combined$mni_z, y=mni_combined$PC1_proj, xlab="z",ylab="PC1", labels = mni_combined$region, main="Dorsoventral")
+
+#highly significant relationship but not as high an r-squared as in mice with m-l axis
+
+```
+
+## top PC1 loadings and PANTHER class enrichment
+
+```{r,top_PC1}
+
+#extract gene loadings 
+#remove Xist (false-positive due uneven sex distribution along with 2 Y-encoded genes)
+pca_anodev_loadings=as.matrix(pca_anodev$rotation[-grep("Xist",rownames(pca_anodev$rotation)),])
+
+pc1_high=rownames(pca_anodev_loadings)[head(order(pca_anodev_loadings[,"PC1"]),n=10)]
+pc1_low=rownames(pca_anodev_loadings)[tail(order(pca_anodev_loadings[,"PC1"]),n=10)]
+pc2_high=rownames(pca_anodev_loadings)[head(order(pca_anodev_loadings[,"PC2"]),n=10)]
+pc2_low=rownames(pca_anodev_loadings)[tail(order(pca_anodev_loadings[,"PC2"]),n=10)]
+
+region.ord.pc1=levels(factor(group_nuclei))[order(tapply(pca_anodev$x[,1], group_nuclei, mean))]
+
+# plot heatmap for top loadings on PC1
+Heatmap(t(scale(t(vst_mean[c(pc1_high,pc1_low),region.ord.pc1]))),col=circlize::colorRamp2(seq(-2.5,2.5, length = 10), rev(RColorBrewer::brewer.pal(10, "RdBu"))), heatmap_legend_param = list(color_bar="continuous", title="Z-score"), show_heatmap_legend = F, cluster_columns = F, cluster_rows = F, show_column_names = F, bottom_annotation_height = unit(1.5,"cm"),bottom_annotation = HeatmapAnnotation(which='column',text=column_anno_text(region.ord.pc1,rot=90,just = c("right", "center"), offset=unit(1.5,'cm'),gp = gpar(cex=1,col=col_hclust1[region.ord.pc1]))))
+
+```
+
+PANTHER class enrichment
+
+```{r,panther}
+
+## read & parse in MGI gene annotations and 
+mgi2genes=read.delim("~/../Desktop/thal/MGI_Gene_Model_Coord.rpt-2017-05-25")
+mgi2genes=data.frame(MGI=sub("MGI\\:","",rownames(mgi2genes)),ENS=mgi2genes$X10..NCBI.gene.strand,symbol=mgi2genes$X2..marker.type)
+
+## read in & parse PANTHER protein class annotation
+panther=read.delim("~/../Desktop/PTHR13.0_mouse.txt", header = F)
+panther_rel=read.delim("~/../Desktop/Protein_class_relationship.txt", header=F)
+
+panther=panther[panther$V9!="",]
+panther$mgi=gsub(".*MGI=|\\|Uni.*","",panther[,1])
+panther$PC=gsub("\\;","\\,",panther$V9)
+panther$ENS=mgi2genes$ENS[match(panther$mgi,mgi2genes$MGI)]
+panther$symbol=mgi2genes$symbol[match(panther$mgi,mgi2genes$MGI)]
+
+panther_list=strsplit(panther$PC,",")
+names(panther_list)=panther$ENS
+
+panther_list2=topGO:::inverseList(panther_list)
+names(panther_list2)=gsub("\\#.*","",names(panther_list2))
+
+overrep.test=function(geneList,geneUniverse,go2genes){
+  et=list()
+  for (i in 1:length(go2genes)){
+    et[[i]]=fisher.test(matrix(c(length(intersect(go2genes[[i]],geneList)),
+                     length(intersect(go2genes[[i]],geneUniverse)),
+                     length(geneList),
+                     length(geneUniverse)),
+                     nrow = 2,ncol = 2))
+    et[[i]]=c(et[[i]]$estimate,et[[i]]$p.value)
+    names(et[[i]])=c("odds","pval")
+  }
+  et=data.frame(terms=names(go2genes),t(as.data.frame(et)))
+  et$fdr=p.adjust(et$pval,method = "BH")
+  rownames(et)=NULL
+  et=et[order(et$pval),]
+  et=droplevels(et[et$odds>1,])
+  et$terms=factor(et$terms, levels = rev(as.character(et$terms)))
+  return(et)
+}
+
+#perform test on top 200 genes with highest absolute PC loadings
+ort_anodev=overrep.test(geneList = names(head(pca_anodev$rotation[,1][order(abs(pca_anodev$rotation[,1]),decreasing = T)],n=200)), geneUniverse = sub('\\..*','',rownames(vst_nuclei)),go2genes = panther_list2)
+
+ort_anodev_ord10=data.frame(ort_anodev[c(1,2,9,5:6,3:4,7,8,10),], stringsAsFactors = F)
+ort_anodev_ord10$level=c(1,2,2,3,3,1,2,1,1,1)
+
+ort_anodev_ord10$names=as.character(ort_anodev_ord10$terms)
+ort_anodev_ord10$names[ort_anodev_ord10$level==2]=paste("     ",ort_anodev_ord10$names[ort_anodev_ord10$level==2])
+ort_anodev_ord10$names[ort_anodev_ord10$level==3]=paste("          ",ort_anodev_ord10$names[ort_anodev_ord10$level==3])
+
+ort_anodev_ord10$names=factor(ort_anodev_ord10$names, levels = rev(ort_anodev_ord10$names))
+ort_anodev_ord10$level=factor(paste("level",ort_anodev_ord10$level,sep="_"))
+ort_anodev_ord10$familiy=c(rep("receptor",5),rep("transporter",2),"signaling molecule","protease","extracellular matrix protein")
+
+# p-values barplot for top 10 PANTHER categories
+ggplot(data = ort_anodev_ord10, aes(x=names,y=log10(pval))) + geom_bar(fill=rev(c(brewer.pal(9,"Blues")[c(7,6,6,4,4)],brewer.pal(9,"YlOrRd")[c(5,4)], "palegreen3","plum3","gray70")),position=position_dodge(), stat="identity",colour="black") + theme(legend.position="none") + labs(x="",y="log10(P-value)") + coord_trans()+ coord_flip() +classic_theme + scale_x_discrete(position = "top")
+
+```
+
+## PCA for receptors and ion channels
+
+PCA plots
+
+```{r, pca_vgic_rec}
+
+##read in IUPHAR/BPS database classification
+gene_fam=read.csv("~/../Downloads/targets_and_families.csv")
+
+genes_vgic=gene_fam$MGI.symbol[gene_fam$Type=="vgic"]
+genes_vgic=as.character(genes_vgic[genes_vgic!=""])
+genes_glugaba=gene_fam$MGI.symbol[grep("glutamate r|GABA.*rec",gene_fam$Family.name)]
+genes_glugaba=as.character(genes_glugaba[genes_glugaba!=""])
+genes_rec=gene_fam$MGI.symbol[grep("glutamate r|GABA.*rec|cholin.* rec|Adrenoceptors|tamine|pamine rec|HT|Opioid|Glycine rec|xytocin|annabin|denosine rec|eurotensin|VIP|omatostat|cystokin|alanin|peptide Y",gene_fam$Family.name)]
+
+genes_rec=as.character(genes_rec[genes_rec!=""])
+genes_vgicrec=c(genes_vgic,genes_rec)
+
+vst_symb=vst_nuclei
+rownames(vst_symb)=make.unique(as.character(genes_M13$gene_symbol[match(rownames(vst_symb),genes_M13$Geneid)]))
+
+genes_vgic=genes_vgic[genes_vgic %in% rownames(vst_symb)]
+genes_rec=genes_rec[genes_rec %in% rownames(vst_symb)]
+
+pc1_high_vgic=rownames(pca_vgic$rotation)[head(order(pca_vgic$rotation[,"PC1"]),n=10)]
+pc1_low_vgic=rownames(pca_vgic$rotation)[tail(order(pca_vgic$rotation[,"PC1"]),n=10)]
+pc1_high_rec=rownames(pca_rec$rotation)[head(order(pca_rec$rotation[,"PC1"]),n=10)]
+pc1_low_rec=rownames(pca_rec$rotation)[tail(order(pca_rec$rotation[,"PC1"]),n=10)]
+
+region.ord.pc1_vgic=levels(factor(group_nuclei))[order(tapply(pca_vgic$x[,1], group_nuclei, mean))]
+region.ord.pc1_rec=levels(factor(group_nuclei))[order(tapply(pca_rec$x[,1], group_nuclei, mean))]
+
+write.csv(pca_vgic$rotation[,1:10],"~/../Dropbox (HHMI)/ThalamoSeq/pca/pca_vgic.csv")
+write.csv(pca_rec$rotation[,1:10],"~/../Dropbox (HHMI)/ThalamoSeq/pca/pca_rec.csv")
+
+
+pdf("~/../Dropbox (HHMI)/ThalamoSeq/manuscript_figures/GO_stuff/heatmap_pc1_vgic.pdf", w=5,h=4.5)
+Heatmap(t(scale(t(vst_mean[c(pc1_high_vgic,pc1_low_vgic),region.ord.pc1_vgic]))),col=circlize::colorRamp2(seq(-2.5,2.5, length = 10), rev(RColorBrewer::brewer.pal(10, "RdBu"))), heatmap_legend_param = list(color_bar="continuous", title="Z-score"), show_heatmap_legend = F, cluster_columns = F, cluster_rows = F, show_column_names = F, bottom_annotation_height = unit(1.5,"cm"),bottom_annotation = HeatmapAnnotation(which='column',text=column_anno_text(region.ord.pc1_vgic,rot=90,just = c("right", "center"), offset=unit(1.5,'cm'),gp = gpar(cex=1,col=col_hclust1[region.ord.pc1_vgic]))))
+dev.off()
+
+par(mfrow=c(1,2))
+pca_vgic=mypca(vst_symb[genes_vgic,], col = col_hclust, labels = group_nuclei)
+title("Voltage-Gated Ion Channels")
+pca_rec=mypca(vst_symb[genes_rec,], col = col_hclust, labels = group_nuclei)
+title("Neurotransmitter Receptors")
+
+```
+
+
+Heatmaps for ion channels and receptors
+
+```{r, hm_vgic_rec}
+
+## read in vgic and receptors types of genes
+rec_anno=read.csv("~/rec_genes.csv")
+vgic_anno=read.csv("~/vgic_genes.csv")
+
+
+#get top loadings
+pc1_high_vgic=rownames(pca_vgic$rotation)[head(order(pca_vgic$rotation[,"PC1"]),n=10)]
+pc1_low_vgic=rownames(pca_vgic$rotation)[tail(order(pca_vgic$rotation[,"PC1"]),n=10)]
+pc1_high_rec=rownames(pca_rec$rotation)[head(order(pca_rec$rotation[,"PC1"]),n=10)]
+pc1_low_rec=rownames(pca_rec$rotation)[tail(order(pca_rec$rotation[,"PC1"]),n=10)]
+
+region.ord.pc1_vgic=levels(factor(group_nuclei))[order(tapply(pca_vgic$x[,1], group_nuclei, mean))]
+region.ord.pc1_rec=levels(factor(group_nuclei))[order(tapply(pca_rec$x[,1], group_nuclei, mean))]
+
+#heatmaps for vgic and rec (top genes)
+Heatmap(t(scale(t(vst_mean[c(pc1_high_vgic,pc1_low_vgic),region.ord.pc1_vgic]))),col=circlize::colorRamp2(seq(-2.5,2.5, length = 10), rev(RColorBrewer::brewer.pal(10, "RdBu"))), heatmap_legend_param = list(color_bar="continuous", title="Z-score"), show_heatmap_legend = F, cluster_columns = F, cluster_rows = F, show_column_names = F, bottom_annotation_height = unit(1.5,"cm"),bottom_annotation = HeatmapAnnotation(which='column',text=column_anno_text(region.ord.pc1_vgic,rot=90,just = c("right", "center"), offset=unit(1.5,'cm'),gp = gpar(cex=1,col=col_hclust1[region.ord.pc1_vgic]))))
+
+Heatmap(t(scale(t(vst_mean[c(pc1_high_rec,pc1_low_rec),region.ord.pc1_rec]))),col=circlize::colorRamp2(seq(-2.5,2.5, length = 10), rev(RColorBrewer::brewer.pal(10, "RdBu"))), heatmap_legend_param = list(color_bar="continuous", title="Z-score"), cluster_columns = F, cluster_rows = F, show_column_names = F, bottom_annotation_height = unit(1.5,"cm"),bottom_annotation = HeatmapAnnotation(which='column',text=column_anno_text(region.ord.pc1_rec,rot=90,just = c("right", "center"), offset=unit(1.5,'cm'),gp = gpar(cex=1,col=col_hclust1[region.ord.pc1_rec]))))
+
+# all VGIC and neurtransmitter receptors
+rec_anno$PC1_pos=pca_rec$rotation[,"PC1"][as.character(rec_anno$Gene)]
+vgic_anno$PC1_pos=pca_vgic$rotation[,"PC1"][as.character(vgic_anno$VGIC)]
+library(dplyr)
+rec_anno$Group=factor(rec_anno$Group,levels = unique(rec_anno$Group))
+vgic_anno$Type=factor(vgic_anno$Type,levels = unique(vgic_anno$Type))
+
+rec_anno=rec_anno %>% arrange(Group,PC1_pos)
+vgic_anno=vgic_anno %>% arrange(Type,PC1_pos)
+
+all_rec=as.character(rec_anno$Gene)
+all_rec_split=factor(rec_anno$Group, levels = unique(rec_anno$Group))
+
+all_vgic=as.character(vgic_anno$VGIC)
+all_vgic_split=factor(vgic_anno$Type, levels = unique(vgic_anno$Type))
+
+#plot heatmaps for all all receptors by type
+Heatmap(t(scale(t(vst_mean[all_vgic,region.ord.pc1_vgic]))),col=circlize::colorRamp2(seq(-2.5,2.5, length = 10), rev(RColorBrewer::brewer.pal(10, "RdBu"))), heatmap_legend_param = list(color_bar="continuous", title="Z-score"), show_heatmap_legend = T, cluster_columns = F, cluster_rows = F, show_column_names = F, split = all_vgic_split,bottom_annotation_height = unit(1.5,"cm"), bottom_annotation = HeatmapAnnotation(which='column',text=column_anno_text(region.ord.pc1_vgic,rot=90,just = c("right", "center"), offset=unit(1.5,'cm'),gp = gpar(cex=1,col=col_hclust1[region.ord.pc1_vgic]))))
+
+HeatmapAnnotation(data.frame(Type = rec_anno$Type), which="row", col = list(Type=c("Ionotropic"="seagreen", "Metabotropic"="salmon"))) + Heatmap(t(scale(t(vst_mean[as.character(rec_anno$Gene),region.ord.pc1_rec]))),col=circlize::colorRamp2(seq(-2.5,2.5, length = 10), rev(RColorBrewer::brewer.pal(10, "RdBu"))), heatmap_legend_param = list(color_bar="continuous", title="Z-score"), show_heatmap_legend = T, cluster_columns = F, cluster_rows = F, show_column_names = F, split = all_rec_split,bottom_annotation_height = unit(1.5,"cm"), bottom_annotation = HeatmapAnnotation(which='column',text=column_anno_text(region.ord.pc1_rec,rot=90,just = c("right", "center"), offset=unit(1.5,'cm'),gp = gpar(cex=1,col=col_hclust1[region.ord.pc1_rec]))))
+
+```
+
+
