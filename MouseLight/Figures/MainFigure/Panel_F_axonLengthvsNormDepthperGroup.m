@@ -71,5 +71,7 @@ hAx.TickDir = 'out';
 xlabel('Axon Length (% total length)');
 ylabel('Cortical Depth (%)');
 hAx.Clipping = 'on';
-hAx.PlotBoxAspectRatio = [1,1.5,1];
+hAx.PlotBoxAspectRatio = [0.9,1,1];
+hAx.YAxisLocation = 'right';
+hAx.XAxis.Direction = 'reverse';
 
